@@ -1,1 +1,492 @@
-# AdGuardHome-edge-spec
+# AdGuardHome Edge — Public Specification
+
+> **Repository status:** This document is the public architectural specification
+> and progress tracker for the AdGuardHome Edge project. The main codebase
+> and production configuration remain **private**. This repository exists to
+> document the design philosophy, engineering decisions, and measurable
+> outcomes of the project in a form that can be shared openly.
+
+---
+
+## Table of Contents
+
+1. [Why Edge? — Executive Summary](#1-why-edge--executive-summary)
+2. [What Was Removed, and Why](#2-what-was-removed-and-why)
+3. [Architecture Overview](#3-architecture-overview)
+4. [The dnsproxy Fork](#4-the-dnsproxy-fork)
+5. [Performance Engineering — AGH Layer](#5-performance-engineering--agh-layer)
+6. [Performance Engineering — Transport Layer (dnsproxy)](#6-performance-engineering--transport-layer-dnsproxy)
+7. [Security Hardening](#7-security-hardening)
+8. [Configuration Reference](#8-configuration-reference)
+9. [Release History](#9-release-history)
+10. [Completeness Status](#10-completeness-status)
+
+---
+
+## 1. Why Edge? — Executive Summary
+
+Standard AdGuardHome is a general-purpose DNS filter designed for broad
+consumer deployment. It ships with a large surface area: cloud-based threat
+feeds (SafeBrowsing, Parental Controls), a full DHCP server, external whois
+TCP queries, DNSSEC validation hooks, per-language UI bundles, an auto-updater,
+and a QUIC transport layer that was never stress-hardened.
+
+**AdGuardHome Edge starts from a different premise.** It is built for a single
+class of deployment: a private, high-performance, privacy-maximising DNS
+resolver running at the network edge — directly in front of user traffic,
+with no tolerance for latency spikes, memory churn, or external dependencies
+in the query hot path.
+
+The engineering goals, in order of priority:
+
+### Privacy by Default
+
+Every feature that sends data outside the local machine was removed or
+replaced with a local equivalent. This includes:
+
+- **SafeBrowsing and Parental Controls** — both rely on AdGuard cloud hashing
+  services. Each DNS query involving a suspicious domain triggers an outbound
+  HTTP call to an external API. This is fundamentally incompatible with an
+  edge resolver that must not leak query information to any third party.
+- **EDNS Client Subnet** — forwards a truncated client IP address to upstream
+  resolvers. Removed entirely: no user location data leaves the resolver.
+- **External Whois** — replaced with local MaxMind GeoIP database lookups.
+  The upstream implementation opened a new TCP connection per query-log entry
+  enrichment; the edge build answers in microseconds from local mmdb files
+  with zero outbound connections.
+- **Auto-updater** — disabled. The upstream updater can replace the binary
+  with a vanilla release, overwriting all edge patches. The `-edge` version
+  suffix sets `CanAutoUpdate = false` at the code level.
+
+### Zero-Allocation Hot Path
+
+A DNS resolver's core loop — receive UDP packet → filter → pack response →
+sendmsg — executes millions of times per day. Every heap allocation in this
+path contributes to GC pause frequency and GC CPU overhead. The edge build
+subjected the entire request pipeline to a systematic allocation audit and
+eliminated every unnecessary allocation, from pipeline dispatch arrays to
+per-response pack buffers.
+
+The most impactful changes moved to a custom fork of the underlying
+[dnsproxy](https://github.com/Ozy-666/dnsproxy) transport library, where
+the write paths for UDP, TCP, and DoT now operate with **zero heap allocations
+per response**.
+
+### Lock Contention Elimination
+
+The upstream codebase uses a single global `serverLock` reader-writer mutex
+to protect DNS server state. Under high request concurrency, this lock
+serializes goroutines that have no actual data dependency on each other. The
+edge build systematically replaced every hot-path `serverLock` acquisition
+with either:
+
+- **`atomic.Pointer[T]`** for fields that are replaced atomically on
+  reconfiguration (access manager, DNS filter), or
+- **narrowed critical sections** that snapshot a pointer in two lines and
+  release the lock before any I/O or channel operation.
+
+Three additional global mutexes in the dnsproxy transport layer were
+eliminated using the same technique.
+
+### Uptime and Operational Correctness
+
+Several latent bugs were fixed as part of the audit:
+
+- A goroutine leak in the query log rotation path that accumulated one leaked
+  goroutine per `Start/Shutdown` cycle.
+- A `flushPending` flag that could get permanently stuck after a rare encoding
+  error, silently blocking all future log flushes.
+- A 100 ms `time.Sleep` held under the global server lock on every
+  configuration reload — a pure unnecessary latency spike on admin changes.
+- A short-read bug in the TCP DNS framing layer (`conn.Read` does not
+  guarantee reading the full length prefix in one call; fixed with
+  `io.ReadFull`).
+- A latent data race on the access manager field in the middleware layer (read
+  without lock or atomic, written under an exclusive lock — undefined behaviour
+  under Go's memory model).
+
+---
+
+## 2. What Was Removed, and Why
+
+| Feature | Lines removed | Reason |
+|---|---|---|
+| **DHCP subsystem** | ~2,400 | Not applicable to edge deployment; significant attack surface |
+| **SafeBrowsing** | ~1,400 | Cloud-dependent; leaks query hashes to AdGuard servers |
+| **Parental Controls** | ~800 | Cloud-dependent; same privacy concern as SafeBrowsing |
+| **SafeSearch** | ~734 (engine) + ~685 (hash-prefix shared library) | Cloud-dependent; shared hash-prefix engine deleted alongside |
+| **Blocked Services** | ~5,200 | 3,286-line service database + all handlers, config, and frontend; not applicable |
+| **DNSSEC validation** | ~400 | Not needed in this deployment; eliminates AD-bit complexity from query path |
+| **EDNS Client Subnet** | ~300 | Leaks truncated client IP to upstream resolvers; incompatible with privacy posture |
+| **Non-English UI locales** | ~2 MB | 35 locale files; language selector; eliminates locale detection path at startup |
+| **External Whois client** | Replaced | Local MaxMind mmdb substituted; zero outbound TCP connections |
+| **OpenAPI dead spec** | 442 lines | Dead endpoint paths, schemas, and enum values for all removed features |
+
+**What was NOT removed:** rule-list based DNS filtering (the core AGH value),
+query logging, statistics, per-client settings, rate limiting, DoT/DoQ/DoH
+support, the admin web UI (English), and all upstream DNS protocol handling.
+
+---
+
+## 3. Architecture Overview
+
+### Network Topology
+
+```
+Internet clients
+      │
+      ├─── HTTPS/H2/H3 :443 ──▶ nginx (TLS termination)
+      │                               │
+      │                               └──▶ Unix domain socket ──▶ AGH (plain HTTP)
+      │
+      ├─── DoT :853 ────────────────────────────────────────────▶ AGH directly
+      ├─── DoQ :853 (UDP) ──────────────────────────────────────▶ AGH directly
+      └─── Plain DNS :53 (UDP+TCP) ─────────────────────────────▶ AGH directly
+
+AGH upstream chain:
+  AGH ──▶ local Unbound (recursive resolver)
+        └──▶ dnscrypt-proxy ──▶ encrypted upstream resolvers
+```
+
+### Key Design Decisions
+
+**Unix domain socket for admin and DoH.** AGH binds its plain HTTP server to
+a Unix socket. nginx proxies all inbound HTTPS traffic to this socket. This
+eliminates the redundant TLS termination AGH would otherwise perform for
+its own HTTPS port — TLS is handled exactly once, at the nginx boundary.
+A middleware layer on the UDS path reconstructs the client IP from the
+`X-Real-IP` header nginx injects, so query logs record real client addresses.
+
+**Timeout alignment.** AGH enforces a 1-second upstream timeout. dnscrypt-proxy
+previously ran with a 2.5-second per-attempt timeout, continuing to issue
+retries and hold sockets open for 1.5 seconds after AGH had already
+returned an error to the client. This was pure wasted resource consumption.
+The dnscrypt-proxy timeout was reduced to 800 ms — tight enough to resolve
+before AGH's deadline, loose enough to not penalise normally-slow upstreams.
+
+**go.mod replace for dnsproxy.** Transport-layer changes that require
+modifications to dnsproxy's internal data structures are maintained in a
+custom fork. The fork is loaded via a `go.mod replace` directive pointing to
+the local fork checkout; no separate module path or versioned tag is required
+for the build system.
+
+---
+
+## 4. The dnsproxy Fork
+
+> **Fork:** [https://github.com/Ozy-666/dnsproxy](https://github.com/Ozy-666/dnsproxy)
+> Branch: `edge-udp-pool` | Base: upstream `v0.81.4`
+
+The upstream [AdguardTeam/dnsproxy](https://github.com/AdguardTeam/dnsproxy)
+library is the transport engine that AGH delegates all DNS protocol handling
+to. It manages UDP sockets, TCP connections, DoT, DoQ, and DoH listeners. For
+an edge resolver, the transport layer's allocation and lock behaviour directly
+determines the GC and CPU profile of the server under sustained load.
+
+A systematic audit of the dnsproxy codebase identified five structural
+problems. All five are fixed in the edge fork.
+
+### 4.1 Zero-Allocation UDP Write Path
+
+**Problem:** Every UDP DNS response called `resp.Pack()`, which internally
+allocates a `[]byte` of exactly the message size. The byte slice is used for
+one `sendmsg` syscall and then discarded. At high query rates this is the
+single most frequent heap allocation in the entire stack.
+
+**Fix:** `respondUDP()` now draws a 2048-byte buffer from a `sync.Pool`,
+calls `resp.PackBuffer()` to pack the message into the pooled buffer (no
+allocation if the response fits), performs the synchronous write (the kernel
+copies bytes before `sendmsg` returns), and immediately returns the buffer to
+the pool. If a response exceeds 2048 bytes, the pool slot is updated to the
+larger allocation, so subsequent oversized responses also benefit.
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| Before | 255 | 160 | **1** |
+| After | ~282 | **0** | **0** |
+
+The ns/op variance is measurement noise. The allocation delta —
+**−1 alloc, −160 B per UDP response** — compounds directly into lower GC
+pressure at sustained query rates.
+
+### 4.2 Zero-Allocation TCP/DoT Path
+
+**Problem:** The TCP DNS framing path allocated four times per round-trip:
+two small allocations for the length prefix, one for the message body, and
+one inside `resp.Pack()`. Additionally, the original read call on the length
+prefix was susceptible to a short-read: a streaming socket may return fewer
+bytes than requested on a single read call, which was not handled.
+
+**Fix:** A 65537-byte pool buffer (2 prefix bytes + maximum DNS message body)
+serves both read and write for an entire TCP round-trip. Two `io.ReadFull`
+calls replace the short-read-prone original. The unpacked DNS message is a
+zero-copy sub-slice of the pool buffer. The response is packed into the same
+pool slot and written as a single call.
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| Before | — | ~512+ | **4** |
+| After | ~251 | **0** | **0** |
+
+### 4.3 Lock-Free Server State Checks
+
+**Problem:** The server state check — called on every TCP keepalive iteration
+to determine whether the proxy is still running — acquired the global embedded
+`sync.RWMutex` read lock. Under a concurrent shutdown, the pending write-lock
+caused all active read-lock callers to queue behind it, producing a
+thundering-herd effect as all goroutines unblocked simultaneously on restart.
+
+**Fix:** The started flag was converted from a plain boolean to `atomic.Bool`.
+The state check is now a single atomic load with no lock acquisition.
+`Start()` and `Shutdown()` retain their exclusive lock (correct: they mutate
+listener slices), but use atomic store/load for the flag itself.
+
+### 4.4 Lock-Free Upstream RTT Statistics (Copy-on-Write)
+
+**Problem:** The upstream weight calculation — called on every load-balanced
+DNS query to select an upstream server by RTT — acquired an **exclusive**
+mutex to *read* the RTT statistics map. This serialized all concurrent DNS
+goroutines at the upstream dispatch point.
+
+**Fix:** The mutable map and its exclusive mutex are replaced with an
+`atomic.Pointer` to an immutable map snapshot, plus a narrow write-only mutex.
+
+- Weight calculation performs a single atomic pointer load — zero contention,
+  no lock. The returned snapshot is consistent for the duration of the
+  calculation.
+- RTT update holds the write mutex only for a shallow map copy (typically
+  2–3 entries), updates one entry, and stores the new pointer atomically.
+  Readers see either the old or the new snapshot, never a partially-written map.
+
+### 4.5 QUIC Per-Connection Stream Limit
+
+**Problem:** The upstream dnsproxy set the maximum incoming streams to 65,535
+per connection for both DoQ and DoH3. A single QUIC client could open 65,535
+concurrent streams per connection, each spawning a goroutine and consuming a
+slot from the global request semaphore. A misbehaving or malicious client
+could starve every other client and protocol on the server.
+
+**Fix:** A configurable `QUICMaxIncomingStreams` field replaces the hardcoded
+constant. QUIC's transport-layer flow control (`MAX_STREAMS` frame) now
+enforces the limit: no goroutine is spawned for a stream beyond the cap.
+Validation logic handles the full input range:
+
+| Input | Behaviour |
+|---|---|
+| `0` (absent / unset) | Silently use default **64** |
+| `[1, 1024]` | Used as-is |
+| Any other non-zero value | `WARN` log emitted; default **64** used |
+
+The field is exposed in `AdGuardHome.yaml` under `dns.quic_max_incoming_streams`
+(introduced in schema v35, deployed default: 64).
+
+### 4.6 Bounded DoH POST Body
+
+**Problem:** The DoH POST handler read the entire request body with no size
+limit. Under a POST flood, each goroutine would allocate memory proportional
+to the request body size until the HTTP read timeout fired, creating GC
+pressure spikes proportional to attack intensity. An acknowledged `TODO`
+comment in the upstream codebase noted this was never resolved.
+
+**Fix:** The read is capped at the DNS wire-format maximum (65,535 bytes per
+RFC 8484). Bodies exceeding this limit receive `413 Request Entity Too Large`
+before any DNS unpacking occurs. All legitimate DoH requests fit within this
+bound.
+
+---
+
+## 5. Performance Engineering — AGH Layer
+
+The following is a complete enumeration of all structural changes applied to
+the AdGuardHome application layer. Each item was identified by static code
+audit and verified by benchmark or race detector.
+
+### 5.1 Memory Management & Allocation Elimination
+
+| # | Location | Problem | Fix | Version |
+|---|---|---|---|---|
+| 1.1 | `ServeDNS` pipeline dispatch | Pipeline function slice heap-allocated per request | Package-level fixed-size array; zero per-request allocation | v0.107.76 |
+| 1.2 | Filter result | Double allocation: result value forced to heap, second allocation immediately abandoned | Struct-copy into pre-allocated slot in DNS context; one allocation eliminated | v0.107.80 |
+| 1.3 | Query log type/class strings | Map lookups on every log entry | Fixed `[256]string` lookup array initialised once; `ClassINET` fast-path returns interned constant | v0.107.81 |
+| 1.4 | Upstream stats slice | Nil-slice + two `append` → two allocations when fallback upstream present | Stack-backed fixed array; reallocation eliminated | v0.107.82 |
+| 1.5 | `NormalizeDomain` | Called three times on the same domain (middleware, filter, stats) | Computed once in `ServeDNS`; all downstream stages read the cached value | v0.107.76 |
+| 1.6 | Client IP formatting | Intermediate allocation in IPv4-mapped address conversion | Direct `Unmap().AsSlice()` — correct IPv4-mapped handling, no intermediate slice | v0.107.76 |
+| 1.7 | Client ID slice | Heap-allocated per request | Stack-backed fixed array | v0.107.76 |
+| 1.8 | Per-request logger | Handler and logger allocated on every request when trace level disabled | Level-gate fast path: one `Enabled()` check, no allocation when level inactive | v0.107.83 |
+| 4.3 | Filter settings | `*filtering.Settings` heap-allocated per DNS request | `sync.Pool`; reset-and-return on request completion; `ClientTags` backing array reused | v0.107.92 |
+
+### 5.2 Concurrency & Lock Contention
+
+| # | Location | Problem | Fix | Version |
+|---|---|---|---|---|
+| 2.1 | Response filtering | `serverLock.RLock()` acquired once **per answer RR** (N locks per response) | Single lock over the full answer loop; lock-free inner function extracted | v0.107.77 |
+| 2.2 | Stats update | Exclusive write lock used for read-only field access | Corrected to read lock; concurrent stat updates no longer serialised | v0.107.78 |
+| 2.3 | Client count check | Redundant outer lock wrapping a call to an already-thread-safe method | Outer lock removed | v0.107.78 |
+| 2.4 | Query log + stats | Global lock held across `ShouldLog`, `logQuery`, `ShouldCount`, `updateStats` | Narrowed to two-line pointer snapshot; lock released before any I/O | v0.107.79 |
+| 2.5 | Client storage | Exclusive mutex serialised all concurrent reads behind writes | Promoted to `sync.RWMutex`; six read-only methods use read lock | v0.107.84 |
+| 2.6 | Query log buffer | Lock held during goroutine creation | Explicit unlock before goroutine spawn | v0.107.85 |
+| 2.7 | Query log flush | Flush-pending flag stuck after encoding error → permanent flush blockage | Buffer clear and flag reset now unconditional before error return | v0.107.85 |
+
+### 5.3 serverLock Hot-Path Elimination (atomic.Pointer)
+
+The global server RWMutex survived on three hot-path call sites after all
+scope-narrowing work was complete. Each was converted to an atomic pointer:
+
+| # | Call site | Before | After | Version |
+|---|---|---|---|---|
+| 5.1 | Access check (outermost middleware, every request) | RLock on every DNS request | Single atomic load; also fixed a latent data race with no synchronization at all | v0.107.94 |
+| 5.2 | Client IP processing | RLock held across full address-processor call (including channel send) | Lock held only for two-word interface snapshot; released before call | v0.107.95 |
+| 5.3 | DNS filter (entire filtering hot path) | RLock held across entire `filterDNSRequest` body | Field converted to `atomic.Pointer`; filtering path is completely lock-free | v0.107.96 |
+
+### 5.4 State Lifecycle & Context Correctness
+
+| # | Issue | Fix | Version |
+|---|---|---|---|
+| 3.1 | `context.TODO()` throughout query log and address processor | `Add/ShouldLog` gain `ctx` parameter; address processor accepts server context | v0.107.90 |
+| 3.2 | Address processor silent IP drops | Drop counter; first drop logs at `Warn`; subsequent at `Debug` with running total | v0.107.91 |
+| 3.3 | `Reconfigure` 100 ms sleep under global lock | Removed: `Shutdown()` is synchronous; `SO_REUSEADDR` makes the grace period unnecessary | v0.107.87 |
+| 3.5 | Log rotation goroutine leak | Cancel/done lifecycle; `Shutdown()` cancels and waits; `Start()` re-entrant-safe | v0.107.88 |
+
+### 5.5 Miscellaneous Correctness Fixes
+
+| Fix | Version |
+|---|---|
+| Config disk-write full struct shallow-copy replaced with selective field assignment; runtime-only fields no longer shared with caller | v0.107.93 |
+| Query log fast-paths: skip client storage lookup when logging globally disabled; skip when host matches ignore list | v0.107.89 |
+| Stats render maps pre-sized across 6 accumulator sites; unbounded growth during large retention window render eliminated | v0.107.86 |
+| GeoIP mmdb reader file-handle leak fixed: handles released on shutdown | v0.107.75 |
+| IPv4-mapped address normalisation: `::ffff:x.x.x.x` looked up as 4-byte IPv4 in GeoIP, not 16-byte IPv6 | v0.107.75 |
+
+---
+
+## 6. Performance Engineering — Transport Layer (dnsproxy)
+
+Summary of all transport-layer changes in the
+[edge fork](https://github.com/Ozy-666/dnsproxy) (`edge-udp-pool` branch,
+based on upstream `v0.81.4`):
+
+| Commit | Change | Impact |
+|---|---|---|
+| `bbd79ad` | `atomic.Bool` for server started state; TCP/DoT pool (65537-byte slots) | State check: lock-free. TCP: **4 allocs/RTT → 0** |
+| `0b14b22` | Upstream RTT mutex → `atomic.Pointer` copy-on-write map | Weight calculation lock-free; upstream dispatch no longer serialised |
+| `00fc061` | DoH POST body: unbounded read → capped at DNS wire maximum | Memory-exhaustion POST flood mitigated; 413 on oversized body |
+| `716e780` | QUIC stream limit 65535 → configurable, default 64 | Stream-flood attack surface eliminated at transport layer |
+
+### Consolidated Benchmark Results
+
+All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
+typical NXDOMAIN/A-record response.
+
+| Path | Before | After | Delta |
+|---|---|---|---|
+| UDP write (per response) | 255 ns · 160 B · **1 alloc** | ~282 ns · **0 B** · **0 allocs** | −1 alloc · −160 B |
+| TCP round-trip (read+write) | — · ~512 B · **4 allocs** | ~251 ns · **0 B** · **0 allocs** | −4 allocs · −512 B |
+| Server state check | RLock/RUnlock on every keepalive | Atomic load (no lock) | Thundering-herd on shutdown eliminated |
+| Upstream weight calculation | Exclusive mutex on every query | Atomic pointer load (no lock) | Contention at dispatch point eliminated |
+
+---
+
+## 7. Security Hardening
+
+| Area | Change | Severity |
+|---|---|---|
+| **DoH POST flood** | Body capped at DNS wire-format maximum (65,535 bytes); `413` returned before any DNS unpacking | Medium — memory exhaustion under targeted POST flood |
+| **QUIC stream flood** | Per-connection stream limit configurable, default 64 (was 65,535); enforced by QUIC transport `MAX_STREAMS` frame | High — single client could drain global request semaphore, starving all others |
+| **Cloud telemetry** | SafeBrowsing, Parental Controls, EDNS-CS all removed; no DNS query data leaves the local machine | Privacy — eliminates data leakage to third-party cloud services |
+| **Auto-update block** | `-edge` suffix detected at runtime; auto-update disabled; upstream release cannot overwrite patched binary | Integrity |
+| **Whois TCP connections** | Replaced with local mmdb; no per-query outbound TCP | Privacy — eliminates external connection from query log enrichment |
+| **Data race fix** | Access manager field in middleware read without synchronization; fixed to atomic load | Correctness — undefined behaviour under Go memory model |
+
+---
+
+## 8. Configuration Reference
+
+Key fields specific to the Edge build. All fields live under their respective
+top-level sections in `AdGuardHome.yaml`.
+
+### `dns` section
+
+| Field | Default | Valid range | Description |
+|---|---|---|---|
+| `quic_max_incoming_streams` | `64` | `[1, 1024]` or `0` | Max concurrent QUIC streams per connection for DoQ/DoH3. `0` silently maps to 64. Values outside `[1, 1024]` log a warning and fall back to 64. Introduced in schema v35. |
+| `upstream_timeout` | `1s` | any duration | Per-request upstream deadline. Should be set below dnscrypt-proxy's own timeout to avoid wasted post-deadline work. |
+| `max_goroutines` | `300` | positive int | Maximum parallel DNS request goroutines. |
+
+### `http` section
+
+| Field | Default | Description |
+|---|---|---|
+| `socket_path` | (unset) | When set, the plain HTTP server binds to a Unix domain socket instead of a TCP address. Required for nginx UDS proxying. |
+
+### Schema versions
+
+| Version | Change |
+|---|---|
+| v35 | Added `dns.quic_max_incoming_streams` (no-op data migration; absent field silently maps to default 64) |
+| v34 | DoH route configuration moved into `http.doh` sub-section |
+
+---
+
+## 9. Release History
+
+| Version | Date | Summary |
+|---|---|---|
+| `v0.107.104-edge` | 2026-05-23 | `dns.quic_max_incoming_streams` exposed in `AdGuardHome.yaml`; schema v34→v35 |
+| `v0.107.103-edge` | 2026-05-23 | dnsproxy fork: configurable QUIC stream limit, default 64, range [1,1024] |
+| `v0.107.102-edge` | 2026-05-23 | dnsproxy fork: DoH POST body bounded to DNS wire maximum |
+| `v0.107.101-edge` | 2026-05-23 | dnsproxy fork: RTT mutex → atomic copy-on-write map |
+| `v0.107.100-edge` | 2026-05-23 | dnsproxy fork: atomic server state; TCP/DoT zero-alloc pool (4 allocs → 0) |
+| `v0.107.99-edge` | 2026-05-23 | dnsproxy fork: zero-alloc UDP pool; rebased to upstream v0.81.4 |
+| `v0.107.98-edge` | 2026-05-22 | Querylog pack buffer pool; filter benchmark baseline established |
+| `v0.107.97-edge` | 2026-05-22 | Infrastructure: dnscrypt-proxy timeout 2500 ms → 800 ms |
+| `v0.107.96-edge` | 2026-05-22 | Filtering hot path lock-free via `atomic.Pointer` |
+| `v0.107.95-edge` | 2026-05-22 | Client IP processing lock narrowed to two-line interface snapshot |
+| `v0.107.94-edge` | 2026-05-21 | Access check lock-free via `atomic.Pointer`; data race in middleware fixed |
+| `v0.107.93-edge` | 2026-05-21 | Config disk-write shallow copy → selective field assignment |
+| `v0.107.92-edge` | 2026-05-21 | Filter settings per-request allocation pooled; tag slice backing array reused |
+| `v0.107.91-edge` | 2026-05-21 | Address processor drop counter; warn-on-first-drop observability |
+| `v0.107.90-edge` | 2026-05-21 | Context propagation: query log and address processor accept caller context |
+| `v0.107.89-edge` | 2026-05-21 | Query log fast-paths: skip storage lookup when disabled or host ignored |
+| `v0.107.88-edge` | 2026-05-21 | Log rotation goroutine lifecycle bounded; leak on Start/Shutdown fixed |
+| `v0.107.87-edge` | 2026-05-21 | 100 ms sleep under global lock on config reload removed |
+| `v0.107.86-edge` | 2026-05-21 | Stats render accumulator maps pre-sized |
+| `v0.107.85-edge` | 2026-05-21 | Query log buffer lock scope narrowed; flush-stuck-flag bug fixed |
+| `v0.107.84-edge` | 2026-05-21 | Client storage: exclusive mutex → reader-writer mutex |
+| `v0.107.83-edge` | 2026-05-21 | Per-request logger allocation eliminated via level-gate fast path |
+| `v0.107.82-edge` | 2026-05-21 | Upstream stats slice: nil+append → stack-backed fixed array |
+| `v0.107.81-edge` | 2026-05-21 | Query log type/class string lookups: map → fixed array |
+| `v0.107.80-edge` | 2026-05-21 | Filter result double-allocation eliminated |
+| `v0.107.79-edge` | 2026-05-21 | Global lock scope in stats/log path narrowed to pointer snapshot |
+| `v0.107.78-edge` | 2026-05-21 | Stats update corrected to read lock; redundant client lock removed |
+| `v0.107.77-edge` | 2026-05-21 | Response filter N per-RR locks → single lock over answer loop |
+| `v0.107.76-edge` | 2026-05-21 | Pipeline dispatch array; domain name cache; IPv4-mapped fix; ID slice stack |
+| `v0.107.75-edge` | 2026-05-19–21 | Initial edge build: full feature strip; Unix socket support; local MaxMind whois; auto-update block |
+
+---
+
+## 10. Completeness Status
+
+The initial architectural audit produced 20 tracked items across 9 categories.
+**All 20 items are complete as of v0.107.104-edge.**
+
+| Category | Items | Status |
+|---|---|---|
+| Memory Management (§1) | 8 | ✅ All complete |
+| Concurrency & Locks (§2) | 7 | ✅ All complete |
+| Timeouts & Lifecycles (§3) | 4 tracked, 1 closed as N/A | ✅ Complete |
+| Architectural Inefficiencies (§4) | 7 | ✅ All complete |
+| serverLock Elimination (§5) | 3 | ✅ All complete |
+| Infrastructure Tuning (§6) | 1 | ✅ Complete |
+| Pack Buffer Pools (§7) | 2 | ✅ Complete |
+| dnsproxy Structural (§8) | 2 | ✅ Complete |
+| dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
+
+No open items remain from the original audit. Future work, if any, would be
+driven by profiling data from sustained production traffic or new upstream
+dnsproxy releases requiring a rebase.
+
+---
+
+*This specification is maintained alongside the private AdGuardHome Edge
+codebase. The public dnsproxy fork is available at
+[https://github.com/Ozy-666/dnsproxy](https://github.com/Ozy-666/dnsproxy).*
