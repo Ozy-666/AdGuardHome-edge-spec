@@ -339,6 +339,7 @@ audit and verified by benchmark or race detector.
 | 4.3 | Filter settings | `*filtering.Settings` heap-allocated per DNS request | `sync.Pool`; reset-and-return on request completion; `ClientTags` backing array reused | v0.107.92 |
 | 1.9 | `matchHost` — `urlfilter.DNSRequest` | `&urlfilter.DNSRequest{}` + two `NewSortedSliceSet` calls heap-allocated per query (tags + identifiers) | `ufReqPool` (`sync.Pool`): one pre-allocated struct reused; sets cleared via `Clear()`+`Add()` per call | v0.107.105 |
 | 1.10 | `matchHost` — `urlfilter.DNSResult` | `MatchRequest()` allocates `*urlfilter.DNSResult` internally on each of the two engine calls per query | `dnsResPool` (`sync.Pool`) + `MatchRequestInto()`; fields nil-zeroed (not `[:0]`) to preserve nil-vs-empty semantics for downstream checks | v0.107.105 |
+| 1.11 | `matchHost` — result cache | Repeated queries for the same domain/qtype re-enter the engine, acquire `engineLock.RLock`, and allocate on every call | Copy-on-Write `atomic.Pointer[matchCacheMap]`: read = 1 atomic load + 1 map lookup, 0 allocs, 0 locks. Cache miss writes under `matchCacheMu` while holding `engineLock.RLock` (prevents stale-write race vs. filter reload). Cap: 5000 entries, discard-and-restart on overflow | v0.107.106 |
 
 ### 5.2 Concurrency & Lock Contention
 
@@ -381,6 +382,57 @@ scope-narrowing work was complete. Each was converted to an atomic pointer:
 | Stats render maps pre-sized across 6 accumulator sites; unbounded growth during large retention window render eliminated | v0.107.86 |
 | GeoIP mmdb reader file-handle leak fixed: handles released on shutdown | v0.107.75 |
 | IPv4-mapped address normalisation: `::ffff:x.x.x.x` looked up as 4-byte IPv4 in GeoIP, not 16-byte IPv6 | v0.107.75 |
+
+### 5.6 Domain Match Cache (Copy-on-Write)
+
+**Problem:** Every DNS query — including the 10th query for `google.com` —
+re-entered the filtering engine. That means: acquiring `engineLock.RLock()`,
+building a `urlfilter.DNSRequest`, calling the shortcut index, iterating the
+noIndex linear scan (O(N_regex) for every query regardless of result), and
+allocating the result objects. Real DNS traffic is highly skewed — the top 100
+domains account for the majority of queries. This work was repeated identically
+on every request.
+
+**Fix:** A Copy-on-Write result cache behind `atomic.Pointer[matchCacheMap]`
+in `DNSFilter` (`internal/filtering/matchcache.go`).
+
+- **Read (hot path):** one `atomic.Pointer.Load()` + one map struct-key
+  lookup. The key `{host string, rrtype uint16}` is a struct — the runtime
+  accesses it in-place without heap allocation. **0 allocations, 0 locks.**
+  The engine lock is never acquired on a cache hit.
+
+- **Write (miss path):** `matchCacheMu.Lock()` → shallow map copy → insert →
+  `atomic.Pointer.Store()`. Called while holding `engineLock.RLock()`, so the
+  write is implicitly serialised against filter reload: `initFiltering` must
+  acquire `engineLock.Lock()` (blocked until all RLock holders release),
+  guaranteeing no stale result from the old engine lands in the cache after it
+  has been cleared.
+
+- **Invalidation:** `invalidateMatchCache()` (stores `nil`) called inside the
+  `engineLock.Lock()` section of `initFiltering`. Any in-flight miss write
+  completes before the lock is acquired, so the cache is clean before the new
+  engine is installed.
+
+- **Scope:** Only anonymous queries (no per-client tags or identifiers) are
+  eligible. Per-client-rule queries always bypass the cache.
+
+- **Cap:** 5,000 entries. On overflow the map is discarded and rebuilt from
+  zero, bounding heap growth without requiring LRU bookkeeping.
+
+Benchmark results (AMD EPYC 7542):
+
+| Path | Before | After | Δ |
+|---|---|---|---|
+| Clean domain (warm cache) | 1553 ns · 4 allocs | **51 ns · 0 allocs** | −97% ns |
+| Exact block (warm cache) | 3225 ns · 9 allocs | **51 ns · 0 allocs** | −98% ns |
+| Regex N=1000, clean miss (warm) | 14,800 ns · 4 allocs | **53 ns · 0 allocs** | −99.6% ns |
+| Cache hit, parallel (4 goroutines) | — | **13 ns · 0 allocs** | lock-free linear scaling |
+
+The O(N_regex) noIndex scan cost — previously 14.8 μs with 1000 regex rules
+and rising linearly with N — is completely eliminated for recurring queries.
+Blocking Bloom filter (Priority 4) and regex consolidation (Priority 5) are
+still valuable for first-hit latency on new domains, but the cache makes them
+non-urgent for typical DNS traffic patterns where domains repeat.
 
 ---
 
@@ -456,6 +508,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.106-edge` | 2026-05-24 | filtering: CoW match cache; warm hit 51 ns · 0 allocs (down from 3225 ns · 9 allocs); O(N_regex) scan eliminated for repeated queries |
 | `v0.107.105-edge` | 2026-05-23 | filtering: `ufReqPool` + `dnsResPool` pools in `matchHost`; −3 allocs/op, −65 B/op on DNS hot path |
 | `v0.107.104-edge` | 2026-05-23 | `dns.quic_max_incoming_streams` exposed in `AdGuardHome.yaml`; schema v34→v35 |
 | `v0.107.103-edge` | 2026-05-23 | dnsproxy fork: configurable QUIC stream limit, default 64, range [1,1024] |
@@ -493,12 +546,12 @@ top-level sections in `AdGuardHome.yaml`.
 ## 10. Completeness Status
 
 The initial architectural audit produced 20 tracked items across 9 categories.
-Two additional items were added from profiler-driven analysis post-audit.
-**All 22 items are complete as of v0.107.105-edge.**
+Three additional items were added from profiler-driven analysis post-audit.
+**All 23 items are complete as of v0.107.106-edge.**
 
 | Category | Items | Status |
 |---|---|---|
-| Memory Management (§1) | 10 | ✅ All complete |
+| Memory Management (§1) | 11 | ✅ All complete |
 | Concurrency & Locks (§2) | 7 | ✅ All complete |
 | Timeouts & Lifecycles (§3) | 4 tracked, 1 closed as N/A | ✅ Complete |
 | Architectural Inefficiencies (§4) | 7 | ✅ All complete |
