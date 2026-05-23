@@ -337,6 +337,8 @@ audit and verified by benchmark or race detector.
 | 1.7 | Client ID slice | Heap-allocated per request | Stack-backed fixed array | v0.107.76 |
 | 1.8 | Per-request logger | Handler and logger allocated on every request when trace level disabled | Level-gate fast path: one `Enabled()` check, no allocation when level inactive | v0.107.83 |
 | 4.3 | Filter settings | `*filtering.Settings` heap-allocated per DNS request | `sync.Pool`; reset-and-return on request completion; `ClientTags` backing array reused | v0.107.92 |
+| 1.9 | `matchHost` — `urlfilter.DNSRequest` | `&urlfilter.DNSRequest{}` + two `NewSortedSliceSet` calls heap-allocated per query (tags + identifiers) | `ufReqPool` (`sync.Pool`): one pre-allocated struct reused; sets cleared via `Clear()`+`Add()` per call | v0.107.105 |
+| 1.10 | `matchHost` — `urlfilter.DNSResult` | `MatchRequest()` allocates `*urlfilter.DNSResult` internally on each of the two engine calls per query | `dnsResPool` (`sync.Pool`) + `MatchRequestInto()`; fields nil-zeroed (not `[:0]`) to preserve nil-vs-empty semantics for downstream checks | v0.107.105 |
 
 ### 5.2 Concurrency & Lock Contention
 
@@ -454,6 +456,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.105-edge` | 2026-05-23 | filtering: `ufReqPool` + `dnsResPool` pools in `matchHost`; −3 allocs/op, −65 B/op on DNS hot path |
 | `v0.107.104-edge` | 2026-05-23 | `dns.quic_max_incoming_streams` exposed in `AdGuardHome.yaml`; schema v34→v35 |
 | `v0.107.103-edge` | 2026-05-23 | dnsproxy fork: configurable QUIC stream limit, default 64, range [1,1024] |
 | `v0.107.102-edge` | 2026-05-23 | dnsproxy fork: DoH POST body bounded to DNS wire maximum |
@@ -490,11 +493,12 @@ top-level sections in `AdGuardHome.yaml`.
 ## 10. Completeness Status
 
 The initial architectural audit produced 20 tracked items across 9 categories.
-**All 20 items are complete as of v0.107.104-edge.**
+Two additional items were added from profiler-driven analysis post-audit.
+**All 22 items are complete as of v0.107.105-edge.**
 
 | Category | Items | Status |
 |---|---|---|
-| Memory Management (§1) | 8 | ✅ All complete |
+| Memory Management (§1) | 10 | ✅ All complete |
 | Concurrency & Locks (§2) | 7 | ✅ All complete |
 | Timeouts & Lifecycles (§3) | 4 tracked, 1 closed as N/A | ✅ Complete |
 | Architectural Inefficiencies (§4) | 7 | ✅ All complete |
@@ -504,9 +508,13 @@ The initial architectural audit produced 20 tracked items across 9 categories.
 | dnsproxy Structural (§8) | 2 | ✅ Complete |
 | dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
 
-No open items remain from the original audit. Future work, if any, would be
-driven by profiling data from sustained production traffic or new upstream
-dnsproxy releases requiring a rebase.
+No open items remain. Future work is driven by profiling data from sustained
+production traffic or new upstream dnsproxy releases requiring a rebase.
+
+The two post-audit additions (items 1.9 and 1.10) were identified by running
+`go test -bench . -benchmem -memprofile` on the filtering package after the
+initial 20-item audit closed — demonstrating the value of profiler-driven
+follow-up rather than treating the audit as a one-time exercise.
 
 ---
 
