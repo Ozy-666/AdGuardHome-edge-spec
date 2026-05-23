@@ -8,8 +8,31 @@
 
 ---
 
+## Production Deployment
+
+The architecture specified in this repository directly powers the backend
+infrastructure of **[dnsdoh.art](https://dnsdoh.art)** — a next-generation,
+ultra-fast, zero-telemetry public DNS resolver.
+
+By running this highly optimised AdGuardHome Edge build tightly integrated
+with a custom [dnsproxy](https://github.com/Ozy-666/dnsproxy) transport layer,
+the production deployment delivers:
+
+- **Strict Privacy:** Zero data retention, zero upstream client leakage
+  (EDNS-CS stripped), and no cloud dependencies.
+- **Maximum Throughput:** Lock-free processing paths designed to withstand
+  high-RPS conditions on AMD EPYC edge hardware.
+- **Modern Protocols:** Native support for plain UDP/TCP DNS,
+  DNS-over-TLS (DoT), DNS-over-QUIC (DoQ), and DNS-over-HTTPS (DoH).
+
+*Frontend UI visualisations and infrastructure metric screenshots will be
+published here as the public deployment scales.*
+
+---
+
 ## Table of Contents
 
+- [Production Deployment](#production-deployment)
 1. [Why Edge? — Executive Summary](#1-why-edge--executive-summary)
 2. [What Was Removed, and Why](#2-what-was-removed-and-why)
 3. [Architecture Overview](#3-architecture-overview)
