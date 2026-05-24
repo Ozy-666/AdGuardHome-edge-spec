@@ -450,46 +450,53 @@ filter, "Priority 4", and regex consolidation, "Priority 5") was investigated an
 
 ---
 
-### 5.7 noIndex Regex Gate — Investigated and Shelved
+### 5.7 noIndex Regexp Scan — AST Shortcut Extraction (v0.107.109)
 
 The `noIndex` slice in `urlfilter`'s network engine holds rules that fit neither
 the shortcut index nor the domain index; it is scanned linearly on every request.
-Two optimizations were planned for the [`urlfilter` fork](https://github.com/Ozy-666/urlfilter):
-a Bloom filter to fast-fail the scan (Priority 4) and merging pure-regex rules into
-one alternation (Priority 5).
 
-Before implementing, the actual composition of `noIndex` was measured against the
-real filter lists:
+This optimization was first **shelved** (2026-05-24) on the rationale that
+host-level regexp rules "never reach the DNS engine." A second review proved that
+**false**, and the vector was closed proactively.
 
-| List | Scope | noIndex rules | empty-shortcut | regex |
-|---|---|---|---|---|
-| AdGuard SDN (the production DNS list) | host-level | **5** | 0 | **0** |
-| AdGuard Base | host-level (DNS) | 25 | 15 | 23 |
-| AdGuard Base | all network rules | 95 | 51 | 66 |
-| EasyList | all network rules | 86 | 5 | 23 |
+**The flaw.** A no-modifier regexp such as `/^ad-[a-z0-9]+\.com$/` passes
+`IsHostLevelNetworkRule()` and *does* enter the DNS engine. The legacy shortcut
+extractor returned an empty shortcut for any regexp containing `?` (it bailed on
+lookahead/optional), so a large class of host-level regexps fell into the
+empty-shortcut bucket and reached the regexp matcher on **every request**. The
+match cache (§5.6/§5.8) shields only *warm hits*; a unique-subdomain flood is
+all-miss, so against a heavy custom regexp list this is an O(N) CPU-exhaustion
+vector — measured at ~110 ns per rule per query (N=1000 → ~110 µs per miss).
 
-**Finding:** on the production DNS list, only 5 rules reach `noIndex`, all clean
-5-character literal shortcuts with zero regex. The per-request cost is five
-substring checks, already negligible and fully short-circuited by the §5.6 match
-cache once warm.
+**Rejected: the alternation gate.** Merging the regexps into one RE2 alternation
+as a fast-fail gate was prototyped and **rejected by benchmark** — it ran ~14×
+*slower* than the linear scan. Anchored regexps reject a non-matching host in O(1)
+individually; the union automaton loses that per-branch early-exit and its compiled
+program grows with N. Empty-literal regexps cannot be prefiltered by any literal
+structure. Killing this idea on data, not theory, was the right call.
 
-**Why a Bloom filter does not apply:** the only expensive `noIndex` rules are those
-with an *empty* shortcut, which by design always fall through to the regex matcher.
-A Bloom filter tests set membership and needs a literal token to key on; an
-empty-shortcut rule offers none, so it cannot be gated. Rules that do have a literal
-shortcut are already gated by a single `strings.Contains`.
+**The fix: AST required-literal extraction.** `findRegexpShortcut` now parses each
+regexp with `regexp/syntax` and extracts the longest **guaranteed-required
+contiguous literal** (e.g. `/^ad[0-9]?-tracker\.com$/` → `-tracker.com`). Such
+rules move into the shortcut index, so a random flood host — which doesn't contain
+the literal — never evaluates them. The walk is conservative: optional, alternated,
+repeated-zero and otherwise non-mandatory subexpressions contribute nothing, so it
+can only *under*-extract and never claims a literal that isn't guaranteed (which
+would drop real matches).
 
-**Why regex consolidation also stays shelved:** the empty-shortcut regex rules in
-the browser-oriented lists almost all carry request-type modifiers
-(`$script`, `$third-party`, `$xmlhttprequest`), so they are not host-level and never
-reach the DNS engine at all.
+**Bluehat verification** (rules of engagement: any divergence or regression →
+revert and drop):
 
-**Decision:** both shelved. The merged-regex alternation gate (a single linear RE2
-pass that fast-fails because a regex match is a necessary condition for any rule
-match) remains the correct design and would be revisited only if a future filter
-profile presents a large set of host-level regex rules on the DNS path. The fork
-remains in place (integrated via a local `go.mod replace`) carrying documentation
-only — no code divergence from upstream `v0.23.2`.
+| Gate | Result |
+|---|---|
+| Equivalence harness (AST vs legacy engine, real SDN+base lists + `requests.json` + procedural hosts) | **0 divergences / 39,983 hosts** |
+| Fuzzing (`-fuzztime=30s`) | **130k executions, 0 divergences** |
+| Pathological/malformed regexps | no panic, bounded work, ~29 allocs (load-time only) |
+| Flood benchmark (N `?`-regexps, random host) | **111 µs → 449 ns at N=1000 (248×), flat in N, 0 query-path allocs** |
+
+Residual: regexps with no ≥5 required literal anywhere (e.g. `/[0-9]{8}/`) remain in
+the linear scan — rare, bounded per-rule, and further limited by per-IP firewall
+rate limits.
 
 ---
 
@@ -609,6 +616,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.109-edge` | 2026-05-25 | urlfilter fork: AST required-literal shortcut extraction indexes host-level regexp rules, closing the empty-shortcut `noIndex` O(N) cache-miss vector (flood N=1000 111µs→449ns, 248×); alternation gate prototyped and rejected by benchmark; verified by equivalence harness (0/39,983) + fuzz |
 | `v0.107.108-edge` | 2026-05-24 | dnsproxy fork: QUIC unidirectional stream limit decoupled from the bidirectional flood cap (fixed 64) so a low cap can't break DoH3 control/QPACK streams (audit W1); inert hardening |
 | `v0.107.107-edge` | 2026-05-24 | filtering: match cache v2 — lock-free fixed-size table replaces CoW map; unique-domain miss 350µs·489KB → 2.1µs·272B (167× / 1797×); closes DoS-amplification vector (audit C1) |
 | `v0.107.106-edge` | 2026-05-24 | filtering: CoW match cache; warm hit 51 ns · 0 allocs (down from 3225 ns · 9 allocs); O(N_regex) scan eliminated for repeated queries |
@@ -663,7 +671,7 @@ Three additional items were added from profiler-driven analysis post-audit.
 | Pack Buffer Pools (§7) | 2 | ✅ Complete |
 | dnsproxy Structural (§8) | 2 | ✅ Complete |
 | dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
-| urlfilter noIndex gate (§5.7) | 2 | ⏸ Investigated, shelved (not warranted) |
+| urlfilter noIndex regexp scan (§5.7) | 1 | ✅ Resolved via AST shortcut extraction (v0.107.109) |
 | Post-audit hardening — match cache v2 (§5.8) | 1 | ✅ Complete (C1, v0.107.107) |
 | Post-audit hardening — QUIC uni-stream decouple (§4.5) | 1 | ✅ Complete (W1, v0.107.108) |
 
