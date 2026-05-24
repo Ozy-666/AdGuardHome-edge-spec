@@ -191,11 +191,14 @@ returned an error to the client. This was pure wasted resource consumption.
 The dnscrypt-proxy timeout was reduced to 800 ms — tight enough to resolve
 before AGH's deadline, loose enough to not penalise normally-slow upstreams.
 
-**go.mod replace for dnsproxy.** Transport-layer changes that require
-modifications to dnsproxy's internal data structures are maintained in a
-custom fork. The fork is loaded via a `go.mod replace` directive pointing to
-the local fork checkout; no separate module path or versioned tag is required
-for the build system.
+**go.mod replace for the forks.** Two dependencies are maintained as custom
+forks, each loaded via a `go.mod replace` directive pointing to a local checkout
+(no separate module path or versioned tag required):
+
+- [dnsproxy](https://github.com/Ozy-666/dnsproxy) — the transport layer (§4).
+- [urlfilter](https://github.com/Ozy-666/urlfilter) — the rule-matching engine,
+  with AST-based shortcut extraction that keeps the regexp hot path O(1) under
+  unique-subdomain floods (§5.7).
 
 ---
 
@@ -692,5 +695,7 @@ follow-up rather than treating the audit as a one-time exercise.
 ---
 
 *This specification is maintained alongside the private AdGuardHome Edge
-codebase. The public dnsproxy fork is available at
-[https://github.com/Ozy-666/dnsproxy](https://github.com/Ozy-666/dnsproxy).*
+codebase. The public forks are available at
+[github.com/Ozy-666/dnsproxy](https://github.com/Ozy-666/dnsproxy) (transport)
+and [github.com/Ozy-666/urlfilter](https://github.com/Ozy-666/urlfilter)
+(filtering engine).*
