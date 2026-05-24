@@ -435,6 +435,11 @@ A follow-up `noIndex`-gate optimization in the `urlfilter` fork (a blocking Bloo
 filter, "Priority 4", and regex consolidation, "Priority 5") was investigated and
 **shelved** — see §5.7.
 
+> **Update (v0.107.107):** a system-wide audit found this copy-on-write cache
+> copied the whole map on every *miss* (≈489 KB/op once full), which a
+> unique-domain flood could weaponize into a DoS-amplification vector. It was
+> replaced with a lock-free fixed-size table — see §5.8.
+
 ---
 
 ### 5.7 noIndex Regex Gate — Investigated and Shelved
@@ -477,6 +482,50 @@ match) remains the correct design and would be revisited only if a future filter
 profile presents a large set of host-level regex rules on the DNS path. The fork
 remains in place (integrated via a local `go.mod replace`) carrying documentation
 only — no code divergence from upstream `v0.23.2`.
+
+---
+
+### 5.8 Domain Match Cache v2 — Lock-Free Fixed-Size Table
+
+**Problem (found in audit, v0.107.106 cache):** the copy-on-write cache (§5.6)
+gave lock-free reads but copied the *entire* map on every cache **miss**
+(≈489 KB/op once full, sawtooth-resetting at 5,000 entries), serialized under a
+single mutex. Cache hits are not the adversarial case — *misses* are. A
+distributed flood of unique random subdomains on port 53/853 (which bypasses the
+nginx rate-limit tier; the firewall caps per-IP query rate but not the
+*aggregate* miss rate) could force continuous O(N) map copies and GC pressure,
+degrading latency for all traffic. Correctness was never affected; availability
+was.
+
+**Fix:** a lock-free, fixed-size, generation-stamped direct-mapped table.
+
+- **Structure:** `[8192]atomic.Pointer[entry]` (a power-of-two slot count),
+  indexed by `maphash.Comparable` over the `{host, rrtype}` key, masked with
+  `& 8191`. 8,192 × 8 B = 64 KiB — L2-resident on the production EPYC 7542
+  (512 KiB private L2 per core); the hot accessed subset stays in L1d.
+- **Per-process random hash seed** so an attacker cannot craft hostnames that
+  collide into one slot to evict a targeted domain.
+- **Read (hot path):** one atomic pointer load + one atomic generation load +
+  an in-place key compare. **0 allocations, no lock.**
+- **Write (miss):** build an immutable entry, one atomic store. **O(1), no
+  lock.** A slot collision overwrites the previous occupant (implicit
+  eviction), so the memory footprint is hard-bounded by the slot count — no
+  sawtooth, no unbounded growth.
+- **Invalidation (filter reload):** a single atomic generation increment.
+  Entries stamped with an older generation are ignored on read and lazily
+  overwritten — no map reallocation, no GC spike. The same lock ordering as
+  before guarantees no result computed against a pre-reload engine survives.
+
+Benchmark results (AMD EPYC 7542, 4 vCPU):
+
+| Path | v1 (CoW) | v2 (lock-free) | Δ |
+|---|---|---|---|
+| Warm hit | 0 allocs · ~13 ns (parallel) | 0 allocs · ~14 ns (parallel) | unchanged |
+| Unique-domain miss | 350,364 ns · 488,648 B · 16 allocs | **2,098 ns · 272 B · 5 allocs** | **167× faster, 1797× less memory** |
+
+The DoS-amplification vector is closed: a sustained unique-domain flood now costs
+one small allocation and one atomic store per query instead of a ~489 KB
+mutex-serialized map copy.
 
 ---
 
@@ -552,6 +601,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.107-edge` | 2026-05-24 | filtering: match cache v2 — lock-free fixed-size table replaces CoW map; unique-domain miss 350µs·489KB → 2.1µs·272B (167× / 1797×); closes DoS-amplification vector (audit C1) |
 | `v0.107.106-edge` | 2026-05-24 | filtering: CoW match cache; warm hit 51 ns · 0 allocs (down from 3225 ns · 9 allocs); O(N_regex) scan eliminated for repeated queries |
 | `v0.107.105-edge` | 2026-05-23 | filtering: `ufReqPool` + `dnsResPool` pools in `matchHost`; −3 allocs/op, −65 B/op on DNS hot path |
 | `v0.107.104-edge` | 2026-05-23 | `dns.quic_max_incoming_streams` exposed in `AdGuardHome.yaml`; schema v34→v35 |
@@ -605,6 +655,7 @@ Three additional items were added from profiler-driven analysis post-audit.
 | dnsproxy Structural (§8) | 2 | ✅ Complete |
 | dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
 | urlfilter noIndex gate (§5.7) | 2 | ⏸ Investigated, shelved (not warranted) |
+| Post-audit hardening — match cache v2 (§5.8) | 1 | ✅ Complete (C1, v0.107.107) |
 
 No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§5.7) was
 measured against the real filter lists and shelved as unwarranted for the DNS
