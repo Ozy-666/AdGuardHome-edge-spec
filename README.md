@@ -14,14 +14,18 @@ The architecture specified in this repository directly powers the backend
 infrastructure of **[dnsdoh.art](https://dnsdoh.art)** — a next-generation,
 ultra-fast, zero-telemetry public DNS resolver.
 
-By running this highly optimised AdGuardHome Edge build tightly integrated
-with a custom [dnsproxy](https://github.com/Ozy-666/dnsproxy) transport layer,
-the production deployment delivers:
+By running this highly optimised AdGuardHome Edge build tightly integrated with
+a custom [dnsproxy](https://github.com/Ozy-666/dnsproxy) transport layer and a
+custom [urlfilter](https://github.com/Ozy-666/urlfilter) filtering engine, the
+production deployment delivers:
 
 - **Strict Privacy:** Zero data retention, zero upstream client leakage
   (EDNS-CS stripped), and no cloud dependencies.
 - **Maximum Throughput:** Lock-free processing paths designed to withstand
   high-RPS conditions on AMD EPYC edge hardware.
+- **Hardened Filtering:** A custom `urlfilter` fork with AST-based shortcut
+  extraction that keeps the rule-matching hot path O(1) even under
+  unique-subdomain floods against heavy regexp blocklists.
 - **Modern Protocols:** Native support for plain UDP/TCP DNS,
   DNS-over-TLS (DoT), DNS-over-QUIC (DoQ), and DNS-over-HTTPS (DoH).
 
