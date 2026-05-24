@@ -303,6 +303,14 @@ Validation logic handles the full input range:
 The field is exposed in `AdGuardHome.yaml` under `dns.quic_max_incoming_streams`
 (introduced in schema v35, deployed default: 64).
 
+**Hardening (v0.107.108):** the cap above applies to *bidirectional* streams,
+which is what DoQ queries use. The *unidirectional* stream limit was previously
+tied to the same value — but HTTP/3 (DoH3) requires at least three uni streams
+per connection (a control stream plus the QPACK encoder and decoder, RFC 9114).
+Setting `quic_max_incoming_streams` to 1–2 would therefore have silently broken
+DoH3 while DoQ kept working. The uni limit is now decoupled and fixed at 64,
+independent of the bidirectional flood-control knob.
+
 ### 4.6 Bounded DoH POST Body
 
 **Problem:** The DoH POST handler read the entire request body with no size
@@ -601,6 +609,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.108-edge` | 2026-05-24 | dnsproxy fork: QUIC unidirectional stream limit decoupled from the bidirectional flood cap (fixed 64) so a low cap can't break DoH3 control/QPACK streams (audit W1); inert hardening |
 | `v0.107.107-edge` | 2026-05-24 | filtering: match cache v2 — lock-free fixed-size table replaces CoW map; unique-domain miss 350µs·489KB → 2.1µs·272B (167× / 1797×); closes DoS-amplification vector (audit C1) |
 | `v0.107.106-edge` | 2026-05-24 | filtering: CoW match cache; warm hit 51 ns · 0 allocs (down from 3225 ns · 9 allocs); O(N_regex) scan eliminated for repeated queries |
 | `v0.107.105-edge` | 2026-05-23 | filtering: `ufReqPool` + `dnsResPool` pools in `matchHost`; −3 allocs/op, −65 B/op on DNS hot path |
@@ -656,6 +665,7 @@ Three additional items were added from profiler-driven analysis post-audit.
 | dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
 | urlfilter noIndex gate (§5.7) | 2 | ⏸ Investigated, shelved (not warranted) |
 | Post-audit hardening — match cache v2 (§5.8) | 1 | ✅ Complete (C1, v0.107.107) |
+| Post-audit hardening — QUIC uni-stream decouple (§4.5) | 1 | ✅ Complete (W1, v0.107.108) |
 
 No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§5.7) was
 measured against the real filter lists and shelved as unwarranted for the DNS
