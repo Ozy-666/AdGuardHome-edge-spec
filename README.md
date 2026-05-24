@@ -430,9 +430,53 @@ Benchmark results (AMD EPYC 7542):
 
 The O(N_regex) noIndex scan cost — previously 14.8 μs with 1000 regex rules
 and rising linearly with N — is completely eliminated for recurring queries.
-Blocking Bloom filter (Priority 4) and regex consolidation (Priority 5) are
-still valuable for first-hit latency on new domains, but the cache makes them
-non-urgent for typical DNS traffic patterns where domains repeat.
+
+A follow-up `noIndex`-gate optimization in the `urlfilter` fork (a blocking Bloom
+filter, "Priority 4", and regex consolidation, "Priority 5") was investigated and
+**shelved** — see §5.7.
+
+---
+
+### 5.7 noIndex Regex Gate — Investigated and Shelved
+
+The `noIndex` slice in `urlfilter`'s network engine holds rules that fit neither
+the shortcut index nor the domain index; it is scanned linearly on every request.
+Two optimizations were planned for the [`urlfilter` fork](https://github.com/Ozy-666/urlfilter):
+a Bloom filter to fast-fail the scan (Priority 4) and merging pure-regex rules into
+one alternation (Priority 5).
+
+Before implementing, the actual composition of `noIndex` was measured against the
+real filter lists:
+
+| List | Scope | noIndex rules | empty-shortcut | regex |
+|---|---|---|---|---|
+| AdGuard SDN (the production DNS list) | host-level | **5** | 0 | **0** |
+| AdGuard Base | host-level (DNS) | 25 | 15 | 23 |
+| AdGuard Base | all network rules | 95 | 51 | 66 |
+| EasyList | all network rules | 86 | 5 | 23 |
+
+**Finding:** on the production DNS list, only 5 rules reach `noIndex`, all clean
+5-character literal shortcuts with zero regex. The per-request cost is five
+substring checks, already negligible and fully short-circuited by the §5.6 match
+cache once warm.
+
+**Why a Bloom filter does not apply:** the only expensive `noIndex` rules are those
+with an *empty* shortcut, which by design always fall through to the regex matcher.
+A Bloom filter tests set membership and needs a literal token to key on; an
+empty-shortcut rule offers none, so it cannot be gated. Rules that do have a literal
+shortcut are already gated by a single `strings.Contains`.
+
+**Why regex consolidation also stays shelved:** the empty-shortcut regex rules in
+the browser-oriented lists almost all carry request-type modifiers
+(`$script`, `$third-party`, `$xmlhttprequest`), so they are not host-level and never
+reach the DNS engine at all.
+
+**Decision:** both shelved. The merged-regex alternation gate (a single linear RE2
+pass that fast-fails because a regex match is a necessary condition for any rule
+match) remains the correct design and would be revisited only if a future filter
+profile presents a large set of host-level regex rules on the DNS path. The fork
+remains in place (integrated via a local `go.mod replace`) carrying documentation
+only — no code divergence from upstream `v0.23.2`.
 
 ---
 
@@ -560,9 +604,12 @@ Three additional items were added from profiler-driven analysis post-audit.
 | Pack Buffer Pools (§7) | 2 | ✅ Complete |
 | dnsproxy Structural (§8) | 2 | ✅ Complete |
 | dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
+| urlfilter noIndex gate (§5.7) | 2 | ⏸ Investigated, shelved (not warranted) |
 
-No open items remain. Future work is driven by profiling data from sustained
-production traffic or new upstream dnsproxy releases requiring a rebase.
+No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§5.7) was
+measured against the real filter lists and shelved as unwarranted for the DNS
+workload. Future work is driven by profiling data from sustained production traffic
+or new upstream dnsproxy releases requiring a rebase.
 
 The two post-audit additions (items 1.9 and 1.10) were identified by running
 `go test -bench . -benchmem -memprofile` on the filtering package after the
