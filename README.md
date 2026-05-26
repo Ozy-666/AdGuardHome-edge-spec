@@ -16,6 +16,33 @@
 
 ---
 
+## 📊 Codebase Modifications & Performance Metrics
+
+Below is a detailed breakdown of the exact subsystem prunings and system-level performance enhancements implemented across our custom forks to maintain near-zero latency and high uptime.
+
+### 🗑️ Subsystem Stripping (Bloat Reduction)
+*These badges represent non-essential features of standard AdGuardHome that have been completely stripped out of our build to reduce resource consumption and eliminate security attack surface:*
+
+[![DHCP Subsystem](https://img.shields.io/badge/DHCP%20Subsystem-Stripped%20(--2400%20LOC)-red?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![SafeBrowsing & Parental](https://img.shields.io/badge/SafeBrowsing%20%26%20Parental-Removed%20(--2200%20LOC)-red?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Blocked Services](https://img.shields.io/badge/Blocked%20Services-Removed%20(--5200%20LOC)-red?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![SafeSearch Engine](https://img.shields.io/badge/SafeSearch%20Engine-Removed%20(--1419%20LOC)-red?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![DNSSEC Engine](https://img.shields.io/badge/DNSSEC%20Engine-Stripped%20%2F%20Offloaded%20to%20Unbound-orange?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![EDNS Subnet](https://img.shields.io/badge/EDNS%20Client%20Subnet-Stripped%20%2F%20Anti--Leak-orange?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![UI Locales](https://img.shields.io/badge/UI%20Locales-English%20Only%20(--2%20MB)-orange?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+
+### ⚡ Engineering Patches & Optimizations
+*These badges represent active code-level corrections, memory allocation pools, and logic improvements in our transport, proxy, and filter components:*
+
+[![TCP DNS Framing](https://img.shields.io/badge/TCP%20DNS%20Framing-io.ReadFull%20Patched-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Goroutine Leaks](https://img.shields.io/badge/Goroutine%20Leaks-Pruned%20%26%20Patched-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Global Lock Sleep](https://img.shields.io/badge/Global%20Lock%20Sleep-Removed%20(100ms%20%E2%86%92%200ms)-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![urlfilter Engine](https://img.shields.io/badge/urlfilter%20Fork-O(1)%20AST%20Regexp-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/urlfilter)
+[![UDP Query Buffers](https://img.shields.io/badge/UDP%20Query%20Buffers-0%20B%2Fop%20(sync.Pool)-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+[![Encrypt Response Pool](https://img.shields.io/badge/Encrypt%20Response-0%20B%2Fop%20(sync.Pool)-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+[![sessionData Map](https://img.shields.io/badge/sessionData%20Map-Lazy--Init%20(0%20allocs)-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+
+---
 ## Production Deployment
 
 The architecture specified in this repository directly powers the backend
