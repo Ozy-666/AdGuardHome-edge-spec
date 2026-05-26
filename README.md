@@ -1,10 +1,18 @@
-# AdGuardHome Edge — Public Specification
+# AdGuardHome Edge - Public Specification
 
-> **Repository status:** This document is the public architectural specification
-> and progress tracker for the AdGuardHome Edge project. The main codebase
-> and production configuration remain **private**. This repository exists to
-> document the design philosophy, engineering decisions, and measurable
-> outcomes of the project in a form that can be shared openly.
+[![Production](https://img.shields.io/badge/Powered_By-dnsdoh.art-000000?style=flat-square&logo=ghost)](https://dnsdoh.art)
+[![Stack](https://img.shields.io/badge/Stack-Nginx%20%E2%86%92%20AGH%20%E2%86%92%20Unbound%20%E2%86%92%20dnscrypt--proxy-007acc?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Protocols](https://img.shields.io/badge/Protocols-DoH3%20%7C%20DoH%20%7C%20DoQ%20%7C%20DoT%20%7C%20DNS-8a2be2?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Binary Size](https://img.shields.io/badge/Binary%20Size-24.6%20MB%20(--10%20MB)-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![UDP Write Allocations](https://img.shields.io/badge/UDP%20Write%20Allocations-0%20B%2Fop-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/dnsproxy)
+[![Query Buffers](https://img.shields.io/badge/Query%20Buffers-Zero--Allocation-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+[![Regexp Engine](https://img.shields.io/badge/urlfilter-O(1)%20Regexp%20Shortcut-brightgreen?style=flat-square&logo=go)](https://github.com/Ozy-666/urlfilter)
+[![EDNS Subnet](https://img.shields.io/badge/EDNS--Client%20Subnet-Stripped%20%2F%20No%20Leakage-success?style=flat-square&logo=securityscorecard)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Bloat Removed](https://img.shields.io/badge/Codebase%20Bloat-13k%2B%20Lines%20Removed-red?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+
+---
+
+**Repository status:** This document is the public architectural specification and progress tracker for the AdGuardHome Edge project. The main codebase and production configuration remain private. This repository exists to document the design philosophy, engineering decisions, and measurable outcomes of the project in a form that can be shared openly.
 
 ---
 
