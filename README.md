@@ -76,12 +76,13 @@ published here as the public deployment scales.*
 2. [What Was Removed, and Why](#2-what-was-removed-and-why)
 3. [Architecture Overview](#3-architecture-overview)
 4. [The dnsproxy Fork](#4-the-dnsproxy-fork)
-5. [Performance Engineering — AGH Layer](#5-performance-engineering--agh-layer)
-6. [Performance Engineering — Transport Layer (dnsproxy)](#6-performance-engineering--transport-layer-dnsproxy)
-7. [Security Hardening](#7-security-hardening)
-8. [Configuration Reference](#8-configuration-reference)
-9. [Release History](#9-release-history)
-10. [Completeness Status](#10-completeness-status)
+5. [The dnscrypt-proxy Fork](#5-the-dnscrypt-proxy-fork)
+6. [Performance Engineering — AGH Layer](#6-performance-engineering--agh-layer)
+7. [Performance Engineering — Transport Layer (dnsproxy)](#7-performance-engineering--transport-layer-dnsproxy)
+8. [Security Hardening](#8-security-hardening)
+9. [Configuration Reference](#9-configuration-reference)
+10. [Release History](#10-release-history)
+11. [Completeness Status](#11-completeness-status)
 
 ---
 
@@ -233,7 +234,7 @@ forks, each loaded via a `go.mod replace` directive pointing to a local checkout
 - [dnsproxy](https://github.com/Ozy-666/dnsproxy) — the transport layer (§4).
 - [urlfilter](https://github.com/Ozy-666/urlfilter) — the rule-matching engine,
   with AST-based shortcut extraction that keeps the regexp hot path O(1) under
-  unique-subdomain floods (§5.7).
+  unique-subdomain floods (§6.7).
 
 ---
 
@@ -368,13 +369,72 @@ bound.
 
 ---
 
-## 5. Performance Engineering — AGH Layer
+## 5. The dnscrypt-proxy Fork
+
+> **Fork:** [https://github.com/Ozy-666/dnscrypt-proxy](https://github.com/Ozy-666/dnscrypt-proxy)
+> Branch: `edge-stable` | Base: upstream `2.1.16`
+
+[dnscrypt-proxy](https://github.com/DNSCrypt/dnscrypt-proxy) is the encrypted
+upstream client at the end of the chain (AGH-Edge → Unbound → **dnscrypt-proxy**
+→ Cloudflare / Quad9 / Google over DNSCrypt + DoH). The edge fork is stripped to
+linux/amd64 only, compiled with `GOAMD64=v3` / `CGO_ENABLED=0`, and carries the
+same zero-allocation / lock-free discipline applied to the rest of the stack.
+
+**Slimming / attack-surface reduction**
+
+- Removed the embedded monitoring UI — an HTTP + WebSocket + Prometheus server
+  with bundled HTML/JS assets — and dropped the `gorilla/websocket` dependency:
+  ~455 KB smaller binary and one fewer network-facing component. The config
+  section is kept inert so existing TOML still decodes.
+
+**Zero-allocation hot path**
+
+- Inbound UDP query buffers and encrypted upstream-response buffers are pooled
+  (`sync.Pool`): from 4096 B / 1 alloc per query to **0 B / 0 allocs**.
+- The per-query plugin `sessionData` map is lazily allocated — **0 allocs** when
+  the active plugins never write session state.
+- Smaller trims: the UDP connection-pool address key is formatted once per query
+  instead of twice; ASCII name reversal avoids the `[]rune` round-trip; a
+  per-query debug string is elided unless debug logging is on.
+
+**Lock-free / concurrency**
+
+- Removed three dead per-query `RWMutex` read-locks on the plugin pipeline (the
+  protected slices are immutable after startup — there is no writer).
+- Server selection (`getOne`) takes a shared read-lock on the WP2 path instead
+  of the exclusive lock, and the O(n) dormant-server recovery scan was moved off
+  the per-query path onto a 10 s maintenance goroutine. The per-query stats
+  update no longer scans the server list under the lock.
+
+**Runtime configuration**
+
+- `lb_strategy = 'wp2'`, `lb_estimator = false` — WP2 is the only strategy that
+  uses the lock-free read-lock selection path, giving parallel server selection
+  across all four cores while spreading load over the anycast upstreams (no
+  flip/herd jitter under load).
+
+**Measured** (AMD EPYC 7542, 4 vCPU, median of 3):
+
+| Change | Before | After |
+|---|---|---|
+| Plugin-pipeline lock (per query) | 64.6 ns | **6.8 ns** (~9.5×) |
+| ASCII name reversal | 309.7 ns, 48 B | **59.2 ns, 32 B** (~5.2×) |
+| Per-query stats update | 59.5 ns | **28.4 ns** (~2.1×) |
+| UDP pool address key | 325.7 ns, 6 allocs | **164.2 ns, 3 allocs** |
+| Pooled UDP / response buffers | 4096 B, 1 alloc | **0 B, 0 allocs** |
+
+Validated under sustained load and malformed-packet fuzzing on the live
+resolver: stable ~20 MB RSS with no leaks, all malformed input dropped at
+validation with no crashes, and throughput bound by upstream RTT while the proxy
+itself used a fraction of one core.
+
+## 6. Performance Engineering — AGH Layer
 
 The following is a complete enumeration of all structural changes applied to
 the AdGuardHome application layer. Each item was identified by static code
 audit and verified by benchmark or race detector.
 
-### 5.1 Memory Management & Allocation Elimination
+### 6.1 Memory Management & Allocation Elimination
 
 | # | Location | Problem | Fix | Version |
 |---|---|---|---|---|
@@ -391,7 +451,7 @@ audit and verified by benchmark or race detector.
 | 1.10 | `matchHost` — `urlfilter.DNSResult` | `MatchRequest()` allocates `*urlfilter.DNSResult` internally on each of the two engine calls per query | `dnsResPool` (`sync.Pool`) + `MatchRequestInto()`; fields nil-zeroed (not `[:0]`) to preserve nil-vs-empty semantics for downstream checks | v0.107.105 |
 | 1.11 | `matchHost` — result cache | Repeated queries for the same domain/qtype re-enter the engine, acquire `engineLock.RLock`, and allocate on every call | Copy-on-Write `atomic.Pointer[matchCacheMap]`: read = 1 atomic load + 1 map lookup, 0 allocs, 0 locks. Cache miss writes under `matchCacheMu` while holding `engineLock.RLock` (prevents stale-write race vs. filter reload). Cap: 5000 entries, discard-and-restart on overflow | v0.107.106 |
 
-### 5.2 Concurrency & Lock Contention
+### 6.2 Concurrency & Lock Contention
 
 | # | Location | Problem | Fix | Version |
 |---|---|---|---|---|
@@ -403,7 +463,7 @@ audit and verified by benchmark or race detector.
 | 2.6 | Query log buffer | Lock held during goroutine creation | Explicit unlock before goroutine spawn | v0.107.85 |
 | 2.7 | Query log flush | Flush-pending flag stuck after encoding error → permanent flush blockage | Buffer clear and flag reset now unconditional before error return | v0.107.85 |
 
-### 5.3 serverLock Hot-Path Elimination (atomic.Pointer)
+### 6.3 serverLock Hot-Path Elimination (atomic.Pointer)
 
 The global server RWMutex survived on three hot-path call sites after all
 scope-narrowing work was complete. Each was converted to an atomic pointer:
@@ -414,7 +474,7 @@ scope-narrowing work was complete. Each was converted to an atomic pointer:
 | 5.2 | Client IP processing | RLock held across full address-processor call (including channel send) | Lock held only for two-word interface snapshot; released before call | v0.107.95 |
 | 5.3 | DNS filter (entire filtering hot path) | RLock held across entire `filterDNSRequest` body | Field converted to `atomic.Pointer`; filtering path is completely lock-free | v0.107.96 |
 
-### 5.4 State Lifecycle & Context Correctness
+### 6.4 State Lifecycle & Context Correctness
 
 | # | Issue | Fix | Version |
 |---|---|---|---|
@@ -423,7 +483,7 @@ scope-narrowing work was complete. Each was converted to an atomic pointer:
 | 3.3 | `Reconfigure` 100 ms sleep under global lock | Removed: `Shutdown()` is synchronous; `SO_REUSEADDR` makes the grace period unnecessary | v0.107.87 |
 | 3.5 | Log rotation goroutine leak | Cancel/done lifecycle; `Shutdown()` cancels and waits; `Start()` re-entrant-safe | v0.107.88 |
 
-### 5.5 Miscellaneous Correctness Fixes
+### 6.5 Miscellaneous Correctness Fixes
 
 | Fix | Version |
 |---|---|
@@ -433,7 +493,7 @@ scope-narrowing work was complete. Each was converted to an atomic pointer:
 | GeoIP mmdb reader file-handle leak fixed: handles released on shutdown | v0.107.75 |
 | IPv4-mapped address normalisation: `::ffff:x.x.x.x` looked up as 4-byte IPv4 in GeoIP, not 16-byte IPv6 | v0.107.75 |
 
-### 5.6 Domain Match Cache (Copy-on-Write)
+### 6.6 Domain Match Cache (Copy-on-Write)
 
 **Problem:** Every DNS query — including the 10th query for `google.com` —
 re-entered the filtering engine. That means: acquiring `engineLock.RLock()`,
@@ -483,16 +543,16 @@ and rising linearly with N — is completely eliminated for recurring queries.
 
 A follow-up `noIndex`-gate optimization in the `urlfilter` fork (a blocking Bloom
 filter, "Priority 4", and regex consolidation, "Priority 5") was investigated and
-**shelved** — see §5.7.
+**shelved** — see §6.7.
 
 > **Update (v0.107.107):** a system-wide audit found this copy-on-write cache
 > copied the whole map on every *miss* (≈489 KB/op once full), which a
 > unique-domain flood could weaponize into a DoS-amplification vector. It was
-> replaced with a lock-free fixed-size table — see §5.8.
+> replaced with a lock-free fixed-size table — see §6.8.
 
 ---
 
-### 5.7 noIndex Regexp Scan — AST Shortcut Extraction (v0.107.109)
+### 6.7 noIndex Regexp Scan — AST Shortcut Extraction (v0.107.109)
 
 The `noIndex` slice in `urlfilter`'s network engine holds rules that fit neither
 the shortcut index nor the domain index; it is scanned linearly on every request.
@@ -506,7 +566,7 @@ host-level regexp rules "never reach the DNS engine." A second review proved tha
 extractor returned an empty shortcut for any regexp containing `?` (it bailed on
 lookahead/optional), so a large class of host-level regexps fell into the
 empty-shortcut bucket and reached the regexp matcher on **every request**. The
-match cache (§5.6/§5.8) shields only *warm hits*; a unique-subdomain flood is
+match cache (§6.6/§6.8) shields only *warm hits*; a unique-subdomain flood is
 all-miss, so against a heavy custom regexp list this is an O(N) CPU-exhaustion
 vector — measured at ~110 ns per rule per query (N=1000 → ~110 µs per miss).
 
@@ -542,9 +602,9 @@ rate limits.
 
 ---
 
-### 5.8 Domain Match Cache v2 — Lock-Free Fixed-Size Table
+### 6.8 Domain Match Cache v2 — Lock-Free Fixed-Size Table
 
-**Problem (found in audit, v0.107.106 cache):** the copy-on-write cache (§5.6)
+**Problem (found in audit, v0.107.106 cache):** the copy-on-write cache (§6.6)
 gave lock-free reads but copied the *entire* map on every cache **miss**
 (≈489 KB/op once full, sawtooth-resetting at 5,000 entries), serialized under a
 single mutex. Cache hits are not the adversarial case — *misses* are. A
@@ -586,7 +646,7 @@ mutex-serialized map copy.
 
 ---
 
-## 6. Performance Engineering — Transport Layer (dnsproxy)
+## 7. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
 [edge fork](https://github.com/Ozy-666/dnsproxy) (`edge-udp-pool` branch,
@@ -613,7 +673,7 @@ typical NXDOMAIN/A-record response.
 
 ---
 
-## 7. Security Hardening
+## 8. Security Hardening
 
 | Area | Change | Severity |
 |---|---|---|
@@ -626,7 +686,7 @@ typical NXDOMAIN/A-record response.
 
 ---
 
-## 8. Configuration Reference
+## 9. Configuration Reference
 
 Key fields specific to the Edge build. All fields live under their respective
 top-level sections in `AdGuardHome.yaml`.
@@ -654,7 +714,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 ---
 
-## 9. Release History
+## 10. Release History
 
 | Version | Date | Summary |
 |---|---|---|
@@ -696,7 +756,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 ---
 
-## 10. Completeness Status
+## 11. Completeness Status
 
 The initial architectural audit produced 20 tracked items across 9 categories.
 Three additional items were added from profiler-driven analysis post-audit.
@@ -713,11 +773,11 @@ Three additional items were added from profiler-driven analysis post-audit.
 | Pack Buffer Pools (§7) | 2 | ✅ Complete |
 | dnsproxy Structural (§8) | 2 | ✅ Complete |
 | dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
-| urlfilter noIndex regexp scan (§5.7) | 1 | ✅ Resolved via AST shortcut extraction (v0.107.109) |
-| Post-audit hardening — match cache v2 (§5.8) | 1 | ✅ Complete (C1, v0.107.107) |
+| urlfilter noIndex regexp scan (§6.7) | 1 | ✅ Resolved via AST shortcut extraction (v0.107.109) |
+| Post-audit hardening — match cache v2 (§6.8) | 1 | ✅ Complete (C1, v0.107.107) |
 | Post-audit hardening — QUIC uni-stream decouple (§4.5) | 1 | ✅ Complete (W1, v0.107.108) |
 
-No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§5.7) was
+No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§6.7) was
 measured against the real filter lists and shelved as unwarranted for the DNS
 workload. Future work is driven by profiling data from sustained production traffic
 or new upstream dnsproxy releases requiring a rebase.
