@@ -386,6 +386,20 @@ same zero-allocation / lock-free discipline applied to the rest of the stack.
   with bundled HTML/JS assets — and dropped the `gorilla/websocket` dependency:
   ~455 KB smaller binary and one fewer network-facing component. The config
   section is kept inert so existing TOML still decodes.
+- Stripped Oblivious DoH (ODoH) entirely — ~800 LOC of config/crypto, the
+  oblivious transport path, target-config fetch, all `StampProtoTypeODoH*`
+  branches, and the `odoh_servers` option (the strict loader no longer
+  recognises the key). Stripped binary ~13.9 MB.
+
+**Privacy / no discretionary egress**
+
+- Remote `[sources]` list downloads are disabled at the binary level —
+  resolver/relay lists load only from local signed cache files (fail-closed) and
+  upstreams are pinned by `[static]` stamps. Combined with the absence of any
+  auto-update or version-check call (audited: `-version` is local-only, the sole
+  `http.Client` is the DoH query transport, `netprobe` is just a UDP probe), the
+  proxy makes **no** discretionary outbound HTTP — only the encrypted DNS queries
+  themselves leave the host.
 
 **Zero-allocation hot path**
 
@@ -396,6 +410,9 @@ same zero-allocation / lock-free discipline applied to the rest of the stack.
 - Smaller trims: the UDP connection-pool address key is formatted once per query
   instead of twice; ASCII name reversal avoids the `[]rune` round-trip; a
   per-query debug string is elided unless debug logging is on.
+- The EDNS0 padding hex (`strings.Repeat("58", …)`) is precomputed once and
+  sliced per DoH query instead of rebuilt — one fewer allocation per padded query
+  (the majority, since WP2 favours the DoH upstreams).
 
 **Lock-free / concurrency**
 
@@ -411,7 +428,22 @@ same zero-allocation / lock-free discipline applied to the rest of the stack.
 - `lb_strategy = 'wp2'`, `lb_estimator = false` — WP2 is the only strategy that
   uses the lock-free read-lock selection path, giving parallel server selection
   across all four cores while spreading load over the anycast upstreams (no
-  flip/herd jitter under load).
+  flip/herd jitter under load). A live A/B (each strategy restarted, warmed, then
+  probed identically) confirmed WP2 is both the **lowest-latency** (seq p50
+  4–5 ms vs 6 ms for `fastest`/`p2`) and **highest-throughput** option (2,285 QPS
+  vs 1,760 / 1,579): `fastest` pins to whatever node was `inner[0]` at startup
+  while WP2's power-of-two sampling keeps catching the momentarily-fastest
+  upstream, and the ~25–30% throughput gap is the exclusive `Lock()` (other
+  strategies) versus WP2's shared `RLock()`.
+
+**Timeouts**
+
+- The toml query budget (800 ms) is wired into the HTTP transport's
+  connection-level timeouts (TCP-connect / `ResponseHeaderTimeout` /
+  `ExpectContinueTimeout`), which had been left at a 30 s default config never
+  overrode. The HTTP/2 idle health-check is decoupled (`ReadIdleTimeout`
+  30 s → 10 s, explicit 5 s `PingTimeout`) so dead DoH keep-alive connections are
+  reaped in ~15 s instead of riding the per-query timeout.
 
 **Measured** (AMD EPYC 7542, 4 vCPU, median of 3):
 
@@ -681,6 +713,9 @@ typical NXDOMAIN/A-record response.
 | **QUIC stream flood** | Per-connection stream limit configurable, default 64 (was 65,535); enforced by QUIC transport `MAX_STREAMS` frame | High — single client could drain global request semaphore, starving all others |
 | **Cloud telemetry** | SafeBrowsing, Parental Controls, EDNS-CS all removed; no DNS query data leaves the local machine | Privacy — eliminates data leakage to third-party cloud services |
 | **Auto-update block** | `-edge` suffix detected at runtime; auto-update disabled; upstream release cannot overwrite patched binary | Integrity |
+| **ODoH removed (dnscrypt-proxy)** | Oblivious DoH stripped entirely (~800 LOC: crypto, transport, target-config fetch, stamps, `odoh_servers` option) | Surface reduction — removes an HPKE-style crypto/wire path and a content-type handler |
+| **No discretionary egress (dnscrypt-proxy)** | Remote source-list downloads disabled (local signed cache only); upstreams pinned by `[static]` stamps; no auto-update / version-check call exists (audited) | Privacy — only encrypted DNS queries leave the host |
+| **Transport timeout tightening (dnscrypt-proxy)** | 30 s default transport timeouts wired to the 800 ms query budget; h2 idle health-check decoupled (10 s read-idle / 5 s ping) | Resource — bounds connect/read and reaps dead keep-alive connections promptly |
 | **Whois TCP connections** | Replaced with local mmdb; no per-query outbound TCP | Privacy — eliminates external connection from query log enrichment |
 | **Data race fix** | Access manager field in middleware read without synchronization; fixed to atomic load | Correctness — undefined behaviour under Go memory model |
 
@@ -718,6 +753,8 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| dnscrypt-proxy fork | 2026-05-28 | Transport timeouts wired to the 800 ms query budget + h2 idle health-check decoupled (10 s read-idle / 5 s ping); precomputed EDNS0 padding (per-DoH-query alloc removed); no-version-check / no-auto-update audit confirmed; live WP2 vs `fastest`/`p2` A/B (WP2 wins latency **and** throughput) |
+| dnscrypt-proxy fork | 2026-05-27 | ODoH stripped (~800 LOC); remote source-list downloads disabled (local signed cache only) + `[static]` stamp pinning; WP2 lock-free `getOne` (`RLock`) + dormant-recovery moved to maintenance goroutine; hot-path UDP buffer pooling + lazy session map |
 | `v0.107.109-edge` | 2026-05-25 | urlfilter fork: AST required-literal shortcut extraction indexes host-level regexp rules, closing the empty-shortcut `noIndex` O(N) cache-miss vector (flood N=1000 111µs→449ns, 248×); alternation gate prototyped and rejected by benchmark; verified by equivalence harness (0/39,983) + fuzz |
 | `v0.107.108-edge` | 2026-05-24 | dnsproxy fork: QUIC unidirectional stream limit decoupled from the bidirectional flood cap (fixed 64) so a low cap can't break DoH3 control/QPACK streams (audit W1); inert hardening |
 | `v0.107.107-edge` | 2026-05-24 | filtering: match cache v2 — lock-free fixed-size table replaces CoW map; unique-domain miss 350µs·489KB → 2.1µs·272B (167× / 1797×); closes DoS-amplification vector (audit C1) |
