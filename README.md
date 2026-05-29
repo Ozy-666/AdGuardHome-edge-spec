@@ -4,10 +4,6 @@
 [![Stack](https://img.shields.io/badge/Stack-Nginx%20%E2%86%92%20AGH%20%E2%86%92%20Unbound%20%E2%86%92%20dnscrypt--proxy-2b6cb0?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![Protocols](https://img.shields.io/badge/Protocols-DoH3%20%7C%20DoH%20%7C%20DoQ%20%7C%20DoT%20%7C%20DNS-2b6cb0?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![Binary Size](https://img.shields.io/badge/Binary%20Size-24.6%20MB%20(--10%20MB)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![UDP Write Allocations](https://img.shields.io/badge/UDP%20Write%20Allocations-0%20B%2Fop-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnsproxy)
-[![Query Buffers](https://img.shields.io/badge/Query%20Buffers-Zero--Allocation-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
-[![Regexp Engine](https://img.shields.io/badge/urlfilter-O(1)%20Regexp%20Shortcut-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/urlfilter)
-[![EDNS Subnet](https://img.shields.io/badge/EDNS--Client%20Subnet-Stripped%20%2F%20No%20Leakage-4a5568?style=flat-square&logo=securityscorecard)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![Bloat Removed](https://img.shields.io/badge/Codebase%20Bloat-13k%2B%20Lines%20Removed-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 
 ---
@@ -32,15 +28,17 @@ Below is a detailed breakdown of the exact subsystem prunings and system-level p
 [![UI Locales](https://img.shields.io/badge/UI%20Locales-English%20Only%20(--2%20MB)-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 
 ### ⚡ Engineering Patches & Optimizations
-*These badges represent active code-level corrections, memory allocation pools, and logic improvements in our transport, proxy, and filter components:*
+*These badges represent active code-level corrections, memory allocation pools, and logic improvements across our transport, proxy, filter, and resolver / OS-tuning layers:*
 
-[![TCP DNS Framing](https://img.shields.io/badge/TCP%20DNS%20Framing-io.ReadFull%20Patched-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Goroutine Leaks](https://img.shields.io/badge/Goroutine%20Leaks-Pruned%20%26%20Patched-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Global Lock Sleep](https://img.shields.io/badge/Global%20Lock%20Sleep-Removed-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![TCP DNS Framing](https://img.shields.io/badge/TCP%20DNS%20Framing-Hardened-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Goroutine Lifecycle](https://img.shields.io/badge/Goroutine%20Lifecycle-Leak--Free-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Config-Reload Stall](https://img.shields.io/badge/Config--Reload%20Stall-Removed-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![urlfilter Engine](https://img.shields.io/badge/urlfilter%20Fork-O(1)%20AST%20Regexp-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/urlfilter)
-[![UDP Query Buffers](https://img.shields.io/badge/UDP%20Query%20Buffers-0%20B%2Fop%20(sync.Pool)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
-[![Encrypt Response Pool](https://img.shields.io/badge/Encrypt%20Response-0%20B%2Fop%20(sync.Pool)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
-[![sessionData Map](https://img.shields.io/badge/sessionData%20Map-Lazy--Init%20(0%20allocs)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+[![UDP Query Buffers](https://img.shields.io/badge/UDP%20Query%20Buffers-0%20allocs%2Fop-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+[![Encrypted Response](https://img.shields.io/badge/Encrypted%20Response-0%20allocs%2Fop-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+[![Session Map](https://img.shields.io/badge/Session%20Map-Lazy--Init%20(0%20allocs)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
+[![Unbound Allocator](https://img.shields.io/badge/Unbound%20Allocator-jemalloc%20(LD__PRELOAD)-2b6cb0?style=flat-square&logo=linux)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Loopback RPS](https://img.shields.io/badge/Loopback%20RPS-Disabled%20(--14%25%20CPU)-2b6cb0?style=flat-square&logo=linux)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 
 ---
 ## Production Deployment
