@@ -77,12 +77,13 @@ published here as the public deployment scales.*
 3. [Architecture Overview](#3-architecture-overview)
 4. [The dnsproxy Fork](#4-the-dnsproxy-fork)
 5. [The dnscrypt-proxy Fork](#5-the-dnscrypt-proxy-fork)
-6. [Performance Engineering — AGH Layer](#6-performance-engineering--agh-layer)
-7. [Performance Engineering — Transport Layer (dnsproxy)](#7-performance-engineering--transport-layer-dnsproxy)
-8. [Security Hardening](#8-security-hardening)
-9. [Configuration Reference](#9-configuration-reference)
-10. [Release History](#10-release-history)
-11. [Completeness Status](#11-completeness-status)
+6. [The Unbound Resolver Layer & System Tuning](#6-the-unbound-resolver-layer--system-tuning)
+7. [Performance Engineering — AGH Layer](#7-performance-engineering--agh-layer)
+8. [Performance Engineering — Transport Layer (dnsproxy)](#8-performance-engineering--transport-layer-dnsproxy)
+9. [Security Hardening](#9-security-hardening)
+10. [Configuration Reference](#10-configuration-reference)
+11. [Release History](#11-release-history)
+12. [Completeness Status](#12-completeness-status)
 
 ---
 
@@ -234,7 +235,7 @@ forks, each loaded via a `go.mod replace` directive pointing to a local checkout
 - [dnsproxy](https://github.com/Ozy-666/dnsproxy) — the transport layer (§4).
 - [urlfilter](https://github.com/Ozy-666/urlfilter) — the rule-matching engine,
   with AST-based shortcut extraction that keeps the regexp hot path O(1) under
-  unique-subdomain floods (§6.7).
+  unique-subdomain floods (§7.7).
 
 ---
 
@@ -460,13 +461,116 @@ resolver: stable ~20 MB RSS with no leaks, all malformed input dropped at
 validation with no crashes, and throughput bound by upstream RTT while the proxy
 itself used a fraction of one core.
 
-## 6. Performance Engineering — AGH Layer
+## 6. The Unbound Resolver Layer & System Tuning
+
+> **Upstream:** [NLnet Labs Unbound](https://nlnetlabs.nl/projects/unbound/) 1.25.x — **tuned, not forked.**
+> Profiled under load and deliberately left unpatched.
+
+Unbound sits in the middle of the upstream chain (AGH → **Unbound :5353** →
+dnscrypt-proxy :5053) as the validating cache. It forwards every query to
+dnscrypt-proxy rather than recursing from root, so its job is caching, DNSSEC
+validation, and response shaping — not iteration. Unlike the dnsproxy / dnscrypt
+/ urlfilter layers, Unbound is mature, security-critical C maintained by NLnet
+Labs for two decades. The engineering posture here is therefore deliberate:
+**tune the deployment and the OS around it, profile before touching code, and
+leave the validated core alone.**
+
+### 6.1 Allocator — jemalloc actually linked
+
+The build had long passed `--with-libjemalloc` to `configure` and the config
+header advertised jemalloc — but **Unbound has no such configure option.** The
+flag was silently ignored (`configure: WARNING: unrecognized options`), so every
+build had in fact been running on glibc `malloc`. jemalloc is now supplied the
+way Unbound actually supports it — a systemd `LD_PRELOAD` drop-in:
+
+```ini
+Environment=LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+Environment=MALLOC_CONF=narenas:4,background_thread:true
+```
+
+`narenas:4` pins one arena per worker thread (the default `4×ncpu = 16` spreads
+dirty pages across sixteen arenas); `background_thread:true` purges freed memory
+asynchronously, off the query hot path. Verified live (mapped in
+`/proc/<pid>/maps`; exactly four `jemalloc_bg_thd` threads). The build script now
+carries a pre-flight check that the preload library and drop-in are present, so
+the regression cannot silently recur.
+
+### 6.2 Cache slab tuning
+
+`msg-`, `rrset-`, `infra-` and `key-cache-slabs` raised from the default `4` to
+**`8`** (2× `num-threads`), giving finer-grained per-cache locking headroom under
+high-concurrency floods — slab-lock contention was the top in-process cost
+measured (§6.4).
+
+### 6.3 AppArmor confinement fixes
+
+Two benign-but-noisy denials on the `unbound` profile were resolved without
+granting any new privilege:
+
+| Denial | Cause | Fix |
+|---|---|---|
+| `transparent_hugepage/enabled` read | jemalloc probes the THP setting at startup | grant read on that one sysctl |
+| `CAP_NET_ADMIN` | `so-rcvbuf`/`so-sndbuf: 8m` make Unbound attempt `SO_RCVBUFFORCE` first | quiet `deny capability net_admin` — the plain `SO_RCVBUF` fallback already reaches 8 MB, since `net.core.rmem_max = 8 MB` |
+
+Both eliminate a per-start audit-log denial while leaving the confinement intact.
+
+### 6.4 Profile-driven verdict — kernel-bound, left unpatched
+
+Unbound was profiled with `perf` under a synthetic **8,000 qps** load (≈600× the
+production norm), cache-miss traffic routed to a local mock so no real upstreams
+were touched, behind an automatic abort guard (system load + a real-user latency
+canary):
+
+| Measurement | Result |
+|---|---|
+| Throughput | 8k qps sustained, 0 lost, 100% NOERROR |
+| Latency | cache-hit **145 µs**, cache-miss **1.1 ms** |
+| On-CPU time in kernel | **70–79%** (network / syscall path) |
+| Top in-process cost | `lruhash_lookup` + spin-lock ≈ **6%** — cache-hash contention on the single forward-target infra entry |
+| DNSSEC crypto | not exercised (insecure mock) |
+
+**Conclusion: Unbound is kernel/network-bound, not CPU-bound, with very large
+headroom.** Its own code is a minority of even a 600×-load profile, and the one
+in-process hot spot is cache-lock contention (addressed by slab tuning in §6.2,
+not by patching). Source patching (a hypothetical "step 3") was assessed and
+**declined** — the measured upside did not justify modifying a security-critical
+resolver core. The dominant costs were all *outside* Unbound: kernel networking
+(§6.5) and CPU security mitigations.
+
+### 6.5 System tuning — RPS disabled on loopback
+
+The single biggest kernel cost the profile surfaced was cross-CPU IPIs
+(`net_rps_send_ipi` plus remote wakeups). Root cause: **Receive Packet Steering
+was enabled on the loopback interface** (`/sys/class/net/lo/queues/rx-0/rps_cpus
+= f`, all four cores). Because the whole stack is loopback (AGH → Unbound →
+dnscrypt on `127.0.0.1`) and loopback receive normally runs in the *sender's* CPU
+context, RPS re-steering every packet to a hash-chosen core generated an IPI
+storm. RPS is a tool for physical NICs with few hardware queues; on loopback it
+is counterproductive.
+
+RPS was disabled on `lo` only — the NIC keeps RPS, which is correct for real
+multi-flow external traffic. Measured under identical 10k-qps loopback load:
+
+| Metric (whole box, 10 s) | RPS on `lo` | RPS off | Δ |
+|---|---|---|---|
+| CPU cycles | 75.8 B | 65.3 B | **−14%** |
+| Instructions | 55.4 B | 44.8 B | −19% |
+| Function-call IPIs | ~230k | ~130–190k | **−30…−40%** |
+| Latency / throughput / loss | — | unchanged | — |
+
+A ~14% box-wide CPU reduction under load at zero latency cost — a larger and
+safer win than any in-process change, and one that benefits the entire loopback
+stack (AGH and dnscrypt-proxy too), not just Unbound.
+
+---
+
+## 7. Performance Engineering — AGH Layer
 
 The following is a complete enumeration of all structural changes applied to
 the AdGuardHome application layer. Each item was identified by static code
 audit and verified by benchmark or race detector.
 
-### 6.1 Memory Management & Allocation Elimination
+### 7.1 Memory Management & Allocation Elimination
 
 | # | Location | Problem | Fix | Version |
 |---|---|---|---|---|
@@ -483,7 +587,7 @@ audit and verified by benchmark or race detector.
 | 1.10 | `matchHost` — `urlfilter.DNSResult` | `MatchRequest()` allocates `*urlfilter.DNSResult` internally on each of the two engine calls per query | `dnsResPool` (`sync.Pool`) + `MatchRequestInto()`; fields nil-zeroed (not `[:0]`) to preserve nil-vs-empty semantics for downstream checks | v0.107.105 |
 | 1.11 | `matchHost` — result cache | Repeated queries for the same domain/qtype re-enter the engine, acquire `engineLock.RLock`, and allocate on every call | Copy-on-Write `atomic.Pointer[matchCacheMap]`: read = 1 atomic load + 1 map lookup, 0 allocs, 0 locks. Cache miss writes under `matchCacheMu` while holding `engineLock.RLock` (prevents stale-write race vs. filter reload). Cap: 5000 entries, discard-and-restart on overflow | v0.107.106 |
 
-### 6.2 Concurrency & Lock Contention
+### 7.2 Concurrency & Lock Contention
 
 | # | Location | Problem | Fix | Version |
 |---|---|---|---|---|
@@ -495,7 +599,7 @@ audit and verified by benchmark or race detector.
 | 2.6 | Query log buffer | Lock held during goroutine creation | Explicit unlock before goroutine spawn | v0.107.85 |
 | 2.7 | Query log flush | Flush-pending flag stuck after encoding error → permanent flush blockage | Buffer clear and flag reset now unconditional before error return | v0.107.85 |
 
-### 6.3 serverLock Hot-Path Elimination (atomic.Pointer)
+### 7.3 serverLock Hot-Path Elimination (atomic.Pointer)
 
 The global server RWMutex survived on three hot-path call sites after all
 scope-narrowing work was complete. Each was converted to an atomic pointer:
@@ -506,7 +610,7 @@ scope-narrowing work was complete. Each was converted to an atomic pointer:
 | 5.2 | Client IP processing | RLock held across full address-processor call (including channel send) | Lock held only for two-word interface snapshot; released before call | v0.107.95 |
 | 5.3 | DNS filter (entire filtering hot path) | RLock held across entire `filterDNSRequest` body | Field converted to `atomic.Pointer`; filtering path is completely lock-free | v0.107.96 |
 
-### 6.4 State Lifecycle & Context Correctness
+### 7.4 State Lifecycle & Context Correctness
 
 | # | Issue | Fix | Version |
 |---|---|---|---|
@@ -515,7 +619,7 @@ scope-narrowing work was complete. Each was converted to an atomic pointer:
 | 3.3 | `Reconfigure` 100 ms sleep under global lock | Removed: `Shutdown()` is synchronous; `SO_REUSEADDR` makes the grace period unnecessary | v0.107.87 |
 | 3.5 | Log rotation goroutine leak | Cancel/done lifecycle; `Shutdown()` cancels and waits; `Start()` re-entrant-safe | v0.107.88 |
 
-### 6.5 Miscellaneous Correctness Fixes
+### 7.5 Miscellaneous Correctness Fixes
 
 | Fix | Version |
 |---|---|
@@ -525,7 +629,7 @@ scope-narrowing work was complete. Each was converted to an atomic pointer:
 | GeoIP mmdb reader file-handle leak fixed: handles released on shutdown | v0.107.75 |
 | IPv4-mapped address normalisation: `::ffff:x.x.x.x` looked up as 4-byte IPv4 in GeoIP, not 16-byte IPv6 | v0.107.75 |
 
-### 6.6 Domain Match Cache (Copy-on-Write)
+### 7.6 Domain Match Cache (Copy-on-Write)
 
 **Problem:** Every DNS query — including the 10th query for `google.com` —
 re-entered the filtering engine. That means: acquiring `engineLock.RLock()`,
@@ -575,16 +679,16 @@ and rising linearly with N — is completely eliminated for recurring queries.
 
 A follow-up `noIndex`-gate optimization in the `urlfilter` fork (a blocking Bloom
 filter, "Priority 4", and regex consolidation, "Priority 5") was investigated and
-**shelved** — see §6.7.
+**shelved** — see §7.7.
 
 > **Update (v0.107.107):** a system-wide audit found this copy-on-write cache
 > copied the whole map on every *miss* (≈489 KB/op once full), which a
 > unique-domain flood could weaponize into a DoS-amplification vector. It was
-> replaced with a lock-free fixed-size table — see §6.8.
+> replaced with a lock-free fixed-size table — see §7.8.
 
 ---
 
-### 6.7 noIndex Regexp Scan — AST Shortcut Extraction (v0.107.109)
+### 7.7 noIndex Regexp Scan — AST Shortcut Extraction (v0.107.109)
 
 The `noIndex` slice in `urlfilter`'s network engine holds rules that fit neither
 the shortcut index nor the domain index; it is scanned linearly on every request.
@@ -598,7 +702,7 @@ host-level regexp rules "never reach the DNS engine." A second review proved tha
 extractor returned an empty shortcut for any regexp containing `?` (it bailed on
 lookahead/optional), so a large class of host-level regexps fell into the
 empty-shortcut bucket and reached the regexp matcher on **every request**. The
-match cache (§6.6/§6.8) shields only *warm hits*; a unique-subdomain flood is
+match cache (§7.6/§7.8) shields only *warm hits*; a unique-subdomain flood is
 all-miss, so against a heavy custom regexp list this is an O(N) CPU-exhaustion
 vector — measured at ~110 ns per rule per query (N=1000 → ~110 µs per miss).
 
@@ -634,9 +738,9 @@ rate limits.
 
 ---
 
-### 6.8 Domain Match Cache v2 — Lock-Free Fixed-Size Table
+### 7.8 Domain Match Cache v2 — Lock-Free Fixed-Size Table
 
-**Problem (found in audit, v0.107.106 cache):** the copy-on-write cache (§6.6)
+**Problem (found in audit, v0.107.106 cache):** the copy-on-write cache (§7.6)
 gave lock-free reads but copied the *entire* map on every cache **miss**
 (≈489 KB/op once full, sawtooth-resetting at 5,000 entries), serialized under a
 single mutex. Cache hits are not the adversarial case — *misses* are. A
@@ -678,7 +782,7 @@ mutex-serialized map copy.
 
 ---
 
-## 7. Performance Engineering — Transport Layer (dnsproxy)
+## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
 [edge fork](https://github.com/Ozy-666/dnsproxy) (`edge-udp-pool` branch,
@@ -705,7 +809,7 @@ typical NXDOMAIN/A-record response.
 
 ---
 
-## 8. Security Hardening
+## 9. Security Hardening
 
 | Area | Change | Severity |
 |---|---|---|
@@ -721,7 +825,7 @@ typical NXDOMAIN/A-record response.
 
 ---
 
-## 9. Configuration Reference
+## 10. Configuration Reference
 
 Key fields specific to the Edge build. All fields live under their respective
 top-level sections in `AdGuardHome.yaml`.
@@ -749,10 +853,12 @@ top-level sections in `AdGuardHome.yaml`.
 
 ---
 
-## 10. Release History
+## 11. Release History
 
 | Version | Date | Summary |
 |---|---|---|
+| Unbound / infra | 2026-05-29 | RPS disabled on the loopback interface (it was steering the all-loopback stack across all 4 cores → cross-CPU IPI storm); measured −14% box CPU and −30…−40% function-call IPIs under load at zero latency cost. NIC RPS retained (§6.5) |
+| Unbound / infra | 2026-05-29 | Unbound: jemalloc actually linked via `LD_PRELOAD` (the `--with-libjemalloc` build flag was a silent no-op → glibc malloc), arenas tuned (`narenas:4`, `background_thread`); cache slabs 4→8; AppArmor THP/`net_admin` denials fixed. Profiled under 600× load — confirmed kernel-bound with large headroom, source patching assessed and declined (§6.1–6.4) |
 | dnscrypt-proxy fork | 2026-05-28 | Transport timeouts wired to the 800 ms query budget + h2 idle health-check decoupled (10 s read-idle / 5 s ping); precomputed EDNS0 padding (per-DoH-query alloc removed); no-version-check / no-auto-update audit confirmed; live WP2 vs `fastest`/`p2` A/B (WP2 wins latency **and** throughput) |
 | dnscrypt-proxy fork | 2026-05-27 | ODoH stripped (~800 LOC); remote source-list downloads disabled (local signed cache only) + `[static]` stamp pinning; WP2 lock-free `getOne` (`RLock`) + dormant-recovery moved to maintenance goroutine; hot-path UDP buffer pooling + lazy session map |
 | `v0.107.109-edge` | 2026-05-25 | urlfilter fork: AST required-literal shortcut extraction indexes host-level regexp rules, closing the empty-shortcut `noIndex` O(N) cache-miss vector (flood N=1000 111µs→449ns, 248×); alternation gate prototyped and rejected by benchmark; verified by equivalence harness (0/39,983) + fuzz |
@@ -793,7 +899,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 ---
 
-## 11. Completeness Status
+## 12. Completeness Status
 
 The initial architectural audit produced 20 tracked items across 9 categories.
 Three additional items were added from profiler-driven analysis post-audit.
@@ -810,11 +916,11 @@ Three additional items were added from profiler-driven analysis post-audit.
 | Pack Buffer Pools (§7) | 2 | ✅ Complete |
 | dnsproxy Structural (§8) | 2 | ✅ Complete |
 | dnsproxy Remaining Audit (§9) | 3 | ✅ All complete |
-| urlfilter noIndex regexp scan (§6.7) | 1 | ✅ Resolved via AST shortcut extraction (v0.107.109) |
-| Post-audit hardening — match cache v2 (§6.8) | 1 | ✅ Complete (C1, v0.107.107) |
+| urlfilter noIndex regexp scan (§7.7) | 1 | ✅ Resolved via AST shortcut extraction (v0.107.109) |
+| Post-audit hardening — match cache v2 (§7.8) | 1 | ✅ Complete (C1, v0.107.107) |
 | Post-audit hardening — QUIC uni-stream decouple (§4.5) | 1 | ✅ Complete (W1, v0.107.108) |
 
-No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§6.7) was
+No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§7.7) was
 measured against the real filter lists and shelved as unwarranted for the DNS
 workload. Future work is driven by profiling data from sustained production traffic
 or new upstream dnsproxy releases requiring a rebase.
