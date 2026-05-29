@@ -461,8 +461,8 @@ itself used a fraction of one core.
 
 ## 6. The Unbound Resolver Layer & System Tuning
 
-> **Upstream:** [NLnet Labs Unbound](https://nlnetlabs.nl/projects/unbound/) 1.25.x — **tuned, not forked.**
-> Profiled under load and deliberately left unpatched.
+> **Upstream:** [NLnet Labs Unbound](https://nlnetlabs.nl/projects/unbound/) 1.25.x — **tuned and re-linked to BoringSSL, not forked.**
+> Profiled under load; the validated C core left unpatched (the crypto *substrate* was swapped — §6.6).
 
 Unbound sits in the middle of the upstream chain (AGH → **Unbound :5353** →
 dnscrypt-proxy :5053) as the validating cache. It forwards every query to
@@ -525,7 +525,7 @@ canary):
 | Latency | cache-hit **145 µs**, cache-miss **1.1 ms** |
 | On-CPU time in kernel | **70–79%** (network / syscall path) |
 | Top in-process cost | `lruhash_lookup` + spin-lock ≈ **6%** — cache-hash contention on the single forward-target infra entry |
-| DNSSEC crypto | not exercised (insecure mock) |
+| DNSSEC crypto | not exercised by the insecure mock — measured + optimized separately in **§6.6** |
 
 **Conclusion: Unbound is kernel/network-bound, not CPU-bound, with very large
 headroom.** Its own code is a minority of even a 600×-load profile, and the one
@@ -559,6 +559,74 @@ multi-flow external traffic. Measured under identical 10k-qps loopback load:
 A ~14% box-wide CPU reduction under load at zero latency cost — a larger and
 safer win than any in-process change, and one that benefits the entire loopback
 stack (AGH and dnscrypt-proxy too), not just Unbound.
+
+### 6.6 Cryptographic Substrate — Unbound on BoringSSL
+
+§6.4 left one cost unmeasured: the insecure mock never exercised **DNSSEC
+signature validation.** Closing that gap drove the most involved change in this
+layer — and, crucially, one made *beneath* the validated core rather than inside
+it. The posture of §6 holds: Unbound's C logic is still untouched; only the crypto
+**library it links** was replaced.
+
+**The measurement.** Re-run under a 100%-signed cache-miss flood (a locally-signed
+ECDSA-P256 island zone, validated end-to-end — `ad` flag confirmed), `perf` showed
+**ECDSA verify consuming ~46% of Unbound's on-CPU time** — the single dominant
+in-process cost once crypto is in play. Validation is two scalar point-multiplies
+per signature; under flood it dominates.
+
+**The OpenSSL dead-end.** The reflex fix — a newer OpenSSL — was tested and
+**rejected on evidence.** Private static builds of OpenSSL **4.0.0** and **3.6.2**
+(Zen 2 `-march=znver2`, `enable-ec_nistp_64_gcc_128`) gained only **~3%** on the
+EVP verify path. The reason is structural: ECDSA-P256 verify is ~80 µs/op and the
+stock system OpenSSL 3.0 *already* uses the hand-tuned `ecp_nistz256` ADX assembly.
+There was no version lever to pull.
+
+**BoringSSL.** Google's BoringSSL pairs **fiat-crypto** (formally-verified field
+arithmetic) with zero of OpenSSL 3.x's provider-dispatch/fetch overhead. Measured
+end-to-end on the live production resolver, identical 8k-qps signed-miss flood:
+
+| Metric (prod, 100% signed-miss) | System OpenSSL 3.0.16 | **Unbound on BoringSSL** | Δ |
+|---|---|---|---|
+| `libcrypto` CPU (self-time) | 46.1% | **39.8%** | **−14% relative** |
+| Throughput | 6,607 qps | **7,241 qps** | **+9.6%** |
+| Avg latency | 12.8 ms | **9.5 ms** | **−26%** |
+| Loss / validation | 0% / 100% | 0% / 100% | — |
+
+`perf` confirms the shift: BoringSSL spends its crypto time in lean
+`ecp_nistz256_*` (fiat-crypto, ADX), where OpenSSL's 44–46% was fragmented across
+`BN_*` plus `OPENSSL_LH_doall_arg` (provider fetch) and a per-verify key re-parse.
+
+> **Measure on the target silicon.** A sister build on a *virtualised* host reported
+> a ~2.4× BoringSSL win — not reproducible here. That VM had its CPUID
+> ADX/BMI2 flags masked, forcing *OpenSSL* onto a slow generic-bignum fallback and
+> inflating the gap. On real EPYC 7542 (Zen 2) the honest figure is ~1.1–1.3× — a
+> worst-case-headroom win, invisible at the cache-warm production norm. Hypervisor
+> benchmarks are not ground truth.
+
+**Build engineering (reproducible, reversible).** BoringSSL is pinned to a fixed
+commit (it has no release/ABI guarantees), staged once to `/opt/boring`, and found
+at runtime via a baked-in **`RUNPATH`** — no `LD_LIBRARY_PATH`. Unbound configures
+with `--with-ssl=/opt/boring --disable-gost` (BoringSSL has no GOST); the build
+disables the wrongly-detected system `ENGINE` header, and builds the daemon + control
+tools **but not `unbound-anchor`** (which needs PKCS7, absent in BoringSSL) — the
+system `unbound-anchor` is preserved for root-key bootstrap, and in-daemon RFC 5011
+still refreshes the trust anchor. The same pinned BoringSSL backs **Nginx** (static
+link) for one unified crypto substrate across the edge. A one-command OpenSSL
+fallback build is retained for instant reversion.
+
+**The trap worth recording.** First deploy crashed at startup:
+`undefined symbol: SSLv23_client_method`. The cause was *not* a missing BoringSSL
+symbol (BoringSSL exports it) — it was **LSM path confinement**. Unbound runs under
+an AppArmor profile that did not permit `/opt/boring/lib`; the loader silently fell
+back to the *system* `libssl.so`, where `SSLv23_client_method` exists only as a
+compatibility **macro, not an exported symbol**. The fix is one profile rule
+(`/opt/boring/lib/*.so* mr,`) — and a lesson: validate the **full** production
+config under the real systemd/AppArmor context, not a minimal one, before a swap.
+
+**Correctness.** Verified on the live resolver across algorithms: real **ECDSA**
+(cloudflare.com) and **RSA** (iana.org) chains validate (`ad`), and a deliberately
+broken zone (`dnssec-failed.org`) is correctly rejected (`SERVFAIL`). Validation
+behaviour is identical to the OpenSSL build — only faster.
 
 ---
 
