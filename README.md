@@ -39,6 +39,8 @@ Below is a detailed breakdown of the exact subsystem prunings and system-level p
 [![Session Map](https://img.shields.io/badge/Session%20Map-Lazy--Init%20(0%20allocs)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
 [![Unbound Allocator](https://img.shields.io/badge/Unbound%20Allocator-jemalloc%20(LD__PRELOAD)-2b6cb0?style=flat-square&logo=linux)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![Loopback RPS](https://img.shields.io/badge/Loopback%20RPS-Disabled%20(--14%25%20CPU)-2b6cb0?style=flat-square&logo=linux)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Client-Storage Lock](https://img.shields.io/badge/Per--Query%20Client%20Lock-Lock--Free%20(--79%25%20contention)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Real-Time WAF Feed](https://img.shields.io/badge/Real--Time%20WAF%20Feed-qfeed%20(0%20allocs%2C%20non--blocking)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 
 ---
 ## Production Deployment
@@ -848,6 +850,82 @@ mutex-serialized map copy.
 
 ---
 
+### 7.9 Per-Query Client-Storage Lock — Profile-Driven Fast Path (2026-06-03)
+
+**Problem.** A mutex profile captured under a sustained DoT flood on the live
+resolver (loopback generator, `SetMutexProfileFraction(1)`, pprof bound to
+localhost) named the dominant lock on the DoT/DoQ hot path:
+`client.(*Storage).CustomUpstreamConfig` accounted for **79% of all mutex-wait
+delay** (1,059 s of 1,336 s over a 30 s window). It runs on *every* query
+(`processUpstream → setCustomUpstream`) and takes the client storage's **writer**
+lock to perform two **read-only** lookups that return nil for any address which is
+not a configured persistent client — i.e. nearly every query. The CPU profile
+confirmed the server was **not** CPU-bound (54 s of CPU samples against 1,059 s of
+*off-CPU* mutex wait), matching the observed symptom exactly: all four cores busy,
+none saturated, throughput capped at ≈2.7 cores. The originally-suspected per-query
+querylog + statistics locks were only ~11% combined — real, but minor.
+
+**Fix.** A lock-free fast-path gate. The upstream manager keeps an `atomic.Bool`
+— true iff at least one client has an *effective* (non-comment, non-empty) custom
+upstream — recomputed under the existing write lock whenever the client set
+changes. `CustomUpstreamConfig` reads the flag locklessly and returns nil
+**without acquiring the lock** when no per-client upstreams exist (the common
+case, and the production configuration). When custom upstreams are present, the
+original locked path is taken unchanged.
+
+**Result.** Re-profiled under the identical load: `CustomUpstreamConfig` is
+**gone** from the mutex profile, and total mutex-wait delay dropped **−45%**
+(1,336 s → 733 s). With the dominant lock removed, the next contention point is
+now visible (`DefaultAddrProc.process`, the client address/WHOIS path) — the
+subject of follow-up profiling. The episode is a clean illustration of the
+project's profile-before-patch discipline: the fix targeted the lock the *data*
+identified, not the one first suspected.
+
+---
+
+### 7.10 Real-Time Query Feed to the Edge WAF (`qfeed`)
+
+The edge deployment runs an L7 anti-abuse layer (an XDP + userspace WAF) in front
+of the resolver. Historically it observed DoT/DoQ behaviour by *tailing AGH's JSON
+query log* — a lossy, flush-lagged signal (tens of seconds behind real time) whose
+per-query write was itself a lock-contention source. The edge build replaces that
+with a purpose-built **real-time per-query feed**.
+
+**Design.** A new `qfeed` package emits one tiny fire-and-forget binary event per
+query to the WAF over an `AF_UNIX` / `SOCK_DGRAM` socket. Each record is a fixed
+**36-byte little-endian** frame — client IP (16 B, IPv4-mapped-in-IPv6), source
+port, an **XXH3-64 hash of the normalized query name**, response code, transport
+(`Do53`/`DoT`/`DoQ`/`DoH`), and a nanosecond timestamp. **The query name never
+crosses the wire** — only its hash — preserving the zero-retention privacy posture
+while still letting the WAF measure distinct-name cardinality and repetition per
+source.
+
+**The resolver never blocks on it.** The hot path (beside querylog/stats) does a
+single non-blocking send of a stack-built `[36]byte` into a buffered channel — no
+heap allocation, no mutex, nanoseconds. A background goroutine drains the channel
+and writes datagrams, dialing the WAF's socket lazily and re-dialing with backoff
+if the WAF restarts. When the channel is full (WAF slow or down) the send takes the
+`default` branch and the record is **dropped** — that drop *is* the intended shed;
+a query is never delayed or failed by the feed. The emitter is a process-wide
+singleton (so reconfiguration never leaks a writer goroutine), nil-safe, and can be
+disabled by an environment variable without a rebuild.
+
+**Why this matters (co-design).** The same per-query write that was a *liability*
+inside the query log becomes, as a lock-free unix-socket tap, a real-time
+*enforcement signal*. It removes the WAF's dependency on the flush-lagged log and
+turns its volumetric scorer — query rate, NXDOMAIN ratio, and distinct-name spray
+per source over a sliding window — from a slow sustained-abuse brake into a
+real-time one. One mechanism, two problems addressed: the lossy log tail retired
+and the WAF given a live `Do53`/`DoT`/`DoQ`/`DoH` window. The feed is detect-only
+by design, and the query log itself is retained unchanged for the admin UI — this
+runs alongside it as a parallel tap.
+
+Validated end-to-end against the live WAF: records decode with **zero** errors and
+the WAF's per-protocol counters track the real `Do53`/`DoT`/`DoQ`/`DoH` traffic
+split the moment the resolver is deployed.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -888,6 +966,7 @@ typical NXDOMAIN/A-record response.
 | **Transport timeout tightening (dnscrypt-proxy)** | 30 s default transport timeouts wired to the 800 ms query budget; h2 idle health-check decoupled (10 s read-idle / 5 s ping) | Resource — bounds connect/read and reaps dead keep-alive connections promptly |
 | **Whois TCP connections** | Replaced with local mmdb; no per-query outbound TCP | Privacy — eliminates external connection from query log enrichment |
 | **Data race fix** | Access manager field in middleware read without synchronization; fixed to atomic load | Correctness — undefined behaviour under Go memory model |
+| **GLiNet path traversal (CVE-2026-41448)** | Backported the upstream v0.107.77 fix: GLiNet auth-token file reads confined to an `os.Root` (rejects `..`/absolute escapes), token filename reduced to a basename. Not exploitable in this deployment (runs without `--glinet`, so the GLiNet middleware is never installed); applied as defense-in-depth and to keep the fork mergeable | Medium — admin-auth bypass via a crafted `Admin-Token` cookie in GLiNet mode |
 
 ---
 
@@ -910,6 +989,12 @@ top-level sections in `AdGuardHome.yaml`.
 |---|---|---|
 | `socket_path` | (unset) | When set, the plain HTTP server binds to a Unix domain socket instead of a TCP address. Required for nginx UDS proxying. |
 
+### Environment flags
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGH_QFEED` | (enabled) | The real-time WAF query feed (§7.10). Set to `0`/`off`/`false`/`no` to disable the emitter without a rebuild. Harmless when the WAF socket is absent — records simply drop. |
+
 ### Schema versions
 
 | Version | Change |
@@ -921,8 +1006,18 @@ top-level sections in `AdGuardHome.yaml`.
 
 ## 11. Release History
 
+> **Note (2026-06-03):** the binary version string was rebased from the internal
+> edge-increment scheme onto the upstream base tag — the deployed build now reports
+> `v0.107.77-edge` — so AGH's own update checker stops flagging the upstream
+> v0.107.77 release (the `-edge` suffix already disables auto-update; this aligns
+> the *base* version too). The three rows below the rebase therefore carry the real
+> binary version rather than the older monotonic counter.
+
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-06-03 | **feat:** shield real-time per-query feed (`qfeed`) — a 36-byte fire-and-forget unix-datagram event per query (XXH3 name *hash* only; the name never leaves the host), non-blocking lock-free emit with drop-on-backpressure shedding, replacing the WAF's flush-lagged querylog tail with a live `Do53`/`DoT`/`DoQ`/`DoH` window (§7.10) |
+| `v0.107.77-edge` | 2026-06-03 | **perf:** per-query `client.CustomUpstreamConfig` writer-lock — measured at **79%** of all mutex-wait delay under a DoT flood — replaced with a lock-free `atomic.Bool` fast path; total mutex-wait **−45%**, the dominant DoT/DoQ contention point removed (§7.9) |
+| `v0.107.77-edge` | 2026-06-03 | **security:** backported the upstream **v0.107.77** GLiNet path-traversal fix (CVE-2026-41448) via `os.Root` confinement; base rebased to v0.107.77. Not exploitable here (no `--glinet`); applied as defense-in-depth (§9) |
 | Unbound / infra | 2026-05-29 | RPS disabled on the loopback interface (it was steering the all-loopback stack across all 4 cores → cross-CPU IPI storm); measured −14% box CPU and −30…−40% function-call IPIs under load at zero latency cost. NIC RPS retained (§6.5) |
 | Unbound / infra | 2026-05-29 | Unbound: jemalloc actually linked via `LD_PRELOAD` (the `--with-libjemalloc` build flag was a silent no-op → glibc malloc), arenas tuned (`narenas:4`, `background_thread`); cache slabs 4→8; AppArmor THP/`net_admin` denials fixed. Profiled under 600× load — confirmed kernel-bound with large headroom, source patching assessed and declined (§6.1–6.4) |
 | dnscrypt-proxy fork | 2026-05-28 | Transport timeouts wired to the 800 ms query budget + h2 idle health-check decoupled (10 s read-idle / 5 s ping); precomputed EDNS0 padding (per-DoH-query alloc removed); no-version-check / no-auto-update audit confirmed; live WP2 vs `fastest`/`p2` A/B (WP2 wins latency **and** throughput) |
@@ -985,6 +1080,8 @@ Three additional items were added from profiler-driven analysis post-audit.
 | urlfilter noIndex regexp scan (§7.7) | 1 | ✅ Resolved via AST shortcut extraction (v0.107.109) |
 | Post-audit hardening — match cache v2 (§7.8) | 1 | ✅ Complete (C1, v0.107.107) |
 | Post-audit hardening — QUIC uni-stream decouple (§4.5) | 1 | ✅ Complete (W1, v0.107.108) |
+| Production profiling — per-query client-storage lock (§7.9) | 1 | ✅ Complete (2026-06-03; −79% of mutex delay) |
+| Co-design — real-time WAF query feed (§7.10) | 1 | ✅ Complete (2026-06-03) |
 
 No open items remain. The `urlfilter` `noIndex` regex-gate optimization (§7.7) was
 measured against the real filter lists and shelved as unwarranted for the DNS
