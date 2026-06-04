@@ -926,6 +926,79 @@ split the moment the resolver is deployed.
 
 ---
 
+### 7.11 Goodput-Collapse Trilogy — Per-Query Serve-Path Locks (2026-06-04)
+
+**Problem.** Under a sustained DoT flood the resolver exhibited *accept-then-collapse*:
+goodput **fell** as offered load rose (≈10,900 answers/s at concurrency 100 down to
+≈2,700 at concurrency 600) while AGH CPU **dropped** from ≈240% to ≈100% on a 4-core
+box that never approached saturation. CPU falling under rising load is the signature of
+goroutines going **off-CPU** — parking on a lock, not running out of compute. A mutex
+profile at the collapse regime (c=500 loopback generator, `SetMutexProfileFraction(1)`,
+pprof bound to localhost) measured **3,470 s of mutex-wait delay** over the window,
+concentrated in three global locks taken on *every query* on the serve path:
+
+| Lock | Share of mutex delay |
+|---|---|
+| query-log `bufferLock` (per-query buffer push) | **42%** |
+| statistics `currMu` (per-query counter update) | **23%** |
+| client `Storage` RWMutex via `UpdateAddress` (WHOIS enrichment write) | **20%** |
+
+Notably the query-log lock — only ~9% at low concurrency, where it had earlier been
+dismissed as minor — became the **dominant** offender at the collapse regime, because a
+single global mutex serialises *harder* as concurrency rises. The three were removed in
+sequence, re-profiling after each (profile-before-patch); each fix exposed the next lock,
+exactly as predicted.
+
+**Fix 1 — query log: async single-consumer (`querylog`).** `Add` no longer takes
+`bufferLock`. It does a non-blocking send of the stack-built entry into a buffered channel;
+a single background consumer is the *only* goroutine that pushes to the ring buffer, so the
+lock is never contended across the many serve goroutines. The channel is FIFO (log order
+preserved) and the consumer batches up to 1024 pushes per lock acquisition so search readers
+are not starved. A full channel drops the entry — shedding *bookkeeping* under overload,
+never the DNS answer. Graceful shutdown/reconfigure drains the queue first.
+
+**Fix 2 — statistics: sharded current unit (`stats`).** The per-query `currMu.Lock()` that
+serialised every counter update is replaced by 16 independently-locked shards. `Update` takes
+a *read* lock on the set (so updates no longer mutually exclude) plus one round-robin shard
+lock; reads and the hourly flush merge the shards. Counters are commutative, so the merge is
+exact. The `unit` type and its serialization are unchanged — the sharding is contained to the
+stats container.
+
+**Fix 3 — WHOIS: bounded per-IP dedup cache (`whois`).** With the first two locks gone, the
+entire residual contention (290 s, **90%**) was `Storage.UpdateAddress` taking the client
+storage *writer* lock. Root cause: the edge fork's GeoIP-backed `whois` lookup (local MaxMind
+ASN+City databases, no external WHOIS by design — see §3) reported `changed=true` on *every*
+call when an IP had GeoIP data, having never carried a cache. So the address processor
+re-enriched every query's source IP and `UpdateAddress` took the write lock per query, its
+`host=="" && info==nil` fast path never engaging. This was confirmed **source-IP-cardinality
+independent** — a 4-distinct-IP flood contended identically to a 16-million-IP one — and
+therefore real for production traffic, where every real client IP resolves in GeoIP. The fix
+adds the cache it always lacked: a two-generation bounded set (clock eviction, capped at
+2¹⁶ per generation) of already-enriched IPs. A repeat IP returns `changed=false`, so
+`UpdateAddress` hits its lock-free fast path — an IP's GeoIP data is static for the lifetime
+of the databases — also eliminating the redundant per-query GeoIP lookups.
+
+**Result.** Re-profiled under the identical c=500 load after each fix:
+
+| Stage | Total mutex-wait delay | Top remaining lock | Goroutines parked on a lock |
+|---|---|---|---|
+| baseline | 3,470 s | query-log 42% | 207 |
+| + async query log | 883 s (**−75%**) | stats 55% | (shifted) |
+| + sharded stats | 324 s (**−91%**) | Storage 90% | 227 |
+| + WHOIS cache | **15.75 s (−99.5%)** | none (scheduler noise) | **0** |
+
+`Storage.UpdateAddress` fell **290 s → 3.6 s**. With every per-query serve-path lock removed,
+**no goroutine parks on a lock** under the flood — the off-CPU collapse signature is gone and
+the resolver is CPU-bound rather than lock-bound. Real-user query latency at the worst tested
+concurrency (c=600) improved from **869 ms → 163 ms**, and goodput rose at every step
+(c=600: 2,693 → 4,414 answers/s across the four binaries), with zero failed queries throughout.
+Each fix is feature-flagged and behaviour-preserving when disabled (`AGH_QLOG_ASYNC`,
+`AGH_WHOIS_CACHE`; the stats sharding is always on). The trilogy is a second clean instance of
+the project's profile-driven discipline — three locks the *data* named, removed in the order it
+named them.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -994,6 +1067,8 @@ top-level sections in `AdGuardHome.yaml`.
 | Variable | Default | Description |
 |---|---|---|
 | `AGH_QFEED` | (enabled) | The real-time WAF query feed (§7.10). Set to `0`/`off`/`false`/`no` to disable the emitter without a rebuild. Harmless when the WAF socket is absent — records simply drop. |
+| `AGH_QLOG_ASYNC` | (enabled) | The asynchronous single-consumer query-log add path (§7.11). Set to `0` to restore the synchronous per-query `bufferLock` push. |
+| `AGH_WHOIS_CACHE` | (enabled) | The bounded per-IP WHOIS dedup cache (§7.11). Set to `0` to restore the original always-`changed` GeoIP lookup. |
 
 ### Schema versions
 
@@ -1015,6 +1090,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-06-04 | **perf:** goodput-collapse trilogy — three per-query serve-path locks removed in profile-named order (query-log `bufferLock` → async single-consumer; statistics `currMu` → 16-way sharded unit; client `Storage.UpdateAddress` write-storm → bounded per-IP WHOIS dedup cache). Total mutex-wait delay under a c=500 DoT flood **3,470 s → 15.75 s (−99.5%)**; zero goroutines park on a lock (lock-bound collapse → CPU-bound); real-user tail latency at c=600 **869 ms → 163 ms** (§7.11) |
 | `v0.107.77-edge` | 2026-06-03 | **feat:** shield real-time per-query feed (`qfeed`) — a 36-byte fire-and-forget unix-datagram event per query (XXH3 name *hash* only; the name never leaves the host), non-blocking lock-free emit with drop-on-backpressure shedding, replacing the WAF's flush-lagged querylog tail with a live `Do53`/`DoT`/`DoQ`/`DoH` window (§7.10) |
 | `v0.107.77-edge` | 2026-06-03 | **perf:** per-query `client.CustomUpstreamConfig` writer-lock — measured at **79%** of all mutex-wait delay under a DoT flood — replaced with a lock-free `atomic.Bool` fast path; total mutex-wait **−45%**, the dominant DoT/DoQ contention point removed (§7.9) |
 | `v0.107.77-edge` | 2026-06-03 | **security:** backported the upstream **v0.107.77** GLiNet path-traversal fix (CVE-2026-41448) via `os.Root` confinement; base rebased to v0.107.77. Not exploitable here (no `--glinet`); applied as defense-in-depth (§9) |
