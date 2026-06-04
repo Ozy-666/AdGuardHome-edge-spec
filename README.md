@@ -1011,6 +1011,40 @@ based on upstream `v0.81.4`):
 | `0b14b22` | Upstream RTT mutex → `atomic.Pointer` copy-on-write map | Weight calculation lock-free; upstream dispatch no longer serialised |
 | `00fc061` | DoH POST body: unbounded read → capped at DNS wire maximum | Memory-exhaustion POST flood mitigated; 413 on oversized body |
 | `716e780` | QUIC stream limit 65535 → configurable, default 64 | Stream-flood attack surface eliminated at transport layer |
+| `7363632` | Plain (UDP/TCP) upstream connection **pool** — reuse instead of dial-and-close per query | Per-query `connect()`/`close()` syscalls eliminated; **goodput ≈ doubled** at high concurrency (§8.1) |
+
+### 8.1 Plain Upstream Connection Pooling
+
+When the front-end resolver's own cache is disabled — as in this deployment, where caching is
+delegated to the on-box unbound at `127.0.0.1:5353` (§6) — AGH forwards *every* query upstream.
+A CPU profile of the deployed resolver under a DoT flood (loopback generator, after the §7.11 lock
+removal left it network-IO bound) showed `net.Dialer.DialContext` at **~19% of all CPU**: dnsproxy's
+`plainDNS` dialed a fresh upstream connection and closed it on *every* exchange — pure
+socket/connect/close syscall overhead, the single largest avoidable cost remaining.
+
+**Fix.** A per-upstream, per-network LIFO connection pool. A connection is checked out for the
+*exclusive* duration of one exchange (write + read) and returned only after a clean, validated
+response — never shared concurrently, which would let DNS responses cross-talk between in-flight
+queries. A pooled connection that errors (stale: upstream restart or idle keep-alive close) is
+discarded and the exchange retried once with a fresh dial. The pool is bounded (1024 idle
+connections per network; overflow closed on return) and drained on `Close`. Feature-flagged:
+`DNSPROXY_PLAIN_POOL=0` restores dial-per-query.
+
+**Result (A/B, identical DoT loopback ramp, before vs after, deployed):**
+
+| concurrency | answers/s before | answers/s after | Δ | real-user canary |
+|---|---|---|---|---|
+| c=100 | 10,672 | 14,975 | **+40%** | 58 → 44 ms |
+| c=200 | 7,319 | 11,110 | **+52%** | 65 → 59 ms |
+| c=400 | 4,775 | 9,605 | **+101%** | 99 → 100 ms |
+| c=600 | 3,196 | 6,126 | **+92%** | 306 → 151 ms |
+
+Re-profiled, `DialContext` is **gone** from the CPU profile and total CPU *fell* (245% → 216%) while
+throughput roughly doubled — the per-query dial was a blocking `connect()` serialization, not merely
+CPU. Connection-count sampling confirmed the upstream sockets plateau at a bounded count per
+concurrency level and are reused, instead of churning thousands of dials per second. The remaining CPU
+is genuine work: the downstream TLS response write (~36%) and the upstream exchange (~31%) — the
+irreducible floor for a forwarding resolver without front-end caching.
 
 ### Consolidated Benchmark Results
 
@@ -1069,6 +1103,13 @@ top-level sections in `AdGuardHome.yaml`.
 | `AGH_QFEED` | (enabled) | The real-time WAF query feed (§7.10). Set to `0`/`off`/`false`/`no` to disable the emitter without a rebuild. Harmless when the WAF socket is absent — records simply drop. |
 | `AGH_QLOG_ASYNC` | (enabled) | The asynchronous single-consumer query-log add path (§7.11). Set to `0` to restore the synchronous per-query `bufferLock` push. |
 | `AGH_WHOIS_CACHE` | (enabled) | The bounded per-IP WHOIS dedup cache (§7.11). Set to `0` to restore the original always-`changed` GeoIP lookup. |
+| `DNSPROXY_PLAIN_POOL` | (enabled) | Plain UDP/TCP upstream connection pooling (§8.1). Set to `0` to restore dial-per-query. |
+
+> **Runtime memory ordering.** `GOMEMLIMIT` is pinned to **380 MiB**, deliberately *below* the
+> cgroup `MemoryHigh=400 MiB` throttle, so Go's GC reclaims under memory pressure before the kernel
+> begins synchronous reclaim on the process. The reverse ordering (limit above the throttle) lets the
+> kernel stall the resolver before the runtime ever acts — a latent footgun caught while profiling the
+> post-lock IO ceiling (live heap there was only ~63 MB, so it had not yet bitten).
 
 ### Schema versions
 
@@ -1090,6 +1131,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-06-04 | **perf:** plain-upstream **connection pooling** (dnsproxy fork `7363632`) — reuse UDP/TCP upstream connections instead of dial-and-close per query; eliminated the ~19% per-query `connect()` CPU the post-lock profile exposed. A/B: goodput **+40…+101%** across the c=100…600 ramp (≈doubled at c=400/600), c=600 canary 306→151 ms (§8.1). Also pinned `GOMEMLIMIT=380 MiB` below the cgroup `MemoryHigh=400 MiB` so Go GC precedes kernel reclaim (§10) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** goodput-collapse trilogy — three per-query serve-path locks removed in profile-named order (query-log `bufferLock` → async single-consumer; statistics `currMu` → 16-way sharded unit; client `Storage.UpdateAddress` write-storm → bounded per-IP WHOIS dedup cache). Total mutex-wait delay under a c=500 DoT flood **3,470 s → 15.75 s (−99.5%)**; zero goroutines park on a lock (lock-bound collapse → CPU-bound); real-user tail latency at c=600 **869 ms → 163 ms** (§7.11) |
 | `v0.107.77-edge` | 2026-06-03 | **feat:** shield real-time per-query feed (`qfeed`) — a 36-byte fire-and-forget unix-datagram event per query (XXH3 name *hash* only; the name never leaves the host), non-blocking lock-free emit with drop-on-backpressure shedding, replacing the WAF's flush-lagged querylog tail with a live `Do53`/`DoT`/`DoQ`/`DoH` window (§7.10) |
 | `v0.107.77-edge` | 2026-06-03 | **perf:** per-query `client.CustomUpstreamConfig` writer-lock — measured at **79%** of all mutex-wait delay under a DoT flood — replaced with a lock-free `atomic.Bool` fast path; total mutex-wait **−45%**, the dominant DoT/DoQ contention point removed (§7.9) |
