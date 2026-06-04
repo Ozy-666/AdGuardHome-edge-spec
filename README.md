@@ -997,6 +997,53 @@ Each fix is feature-flagged and behaviour-preserving when disabled (`AGH_QLOG_AS
 the project's profile-driven discipline — three locks the *data* named, removed in the order it
 named them.
 
+### 7.12 Blocked-Response TTL Lock — Read Under the Writer Lock (2026-06-04)
+
+A follow-on of the same bug class, surfaced by profiling the cache-enabled serve path (§7.13)
+under a 26k-qps replay of real query names: once the front cache made the rest of the path fast,
+the **top mutex contention (568 s, 86.8% of all mutex delay)** was
+`filtering.(*DNSFilter).BlockedResponseTTL` — a read-only accessor that took the **exclusive**
+`confMu.Lock()` to read a single `uint32`, serializing **every blocked query** on the filter-config
+mutex. Its sibling getters (`BlockingMode`, protection-status) already used `RLock`; this one was
+the lone outlier. Changed to `RLock` (writers are rare config changes only) — the serialization is
+gone with no behaviour change. It matters under blocked-domain load (filtering-heavy traffic, or a
+flood aimed at blocklisted/tracker domains).
+
+### 7.13 AGH Front-Cache — Delegated Caching Reconsidered (2026-06-04)
+
+The deployment historically ran AGH with **`cache_enabled: false`**, delegating all caching to the
+on-box unbound (§6) to avoid a redundant second cache. Profiling the post-pooling resolver (§8.1)
+showed that decision had a cost: with AGH caching nothing, **every** query — including ones unbound
+would serve from *its* cache — still paid a full localhost round-trip (serialize → socket write →
+unbound lookup → read → parse), measured at **~31% of CPU** under load.
+
+**Measured the real hit rate first.** unbound's organic cache-hit rate (delta over a quiet window,
+load-test traffic excluded) was **57%** — i.e. ~57% of real queries are repeats an AGH front-cache
+would absorb without the hop. (The lifetime 98% figure was pollution from single-domain load tests.)
+
+**Enabled** `cache_enabled: true` with **`cache_ttl_min: 0`** — the latter deliberately so AGH
+respects real upstream TTLs and does **not** pin short-TTL CDN/GSLB answers (the one real regression
+risk of a second cache). It is DNSSEC-safe (the cache keys on the DO bit), filtering still runs
+*before* the cache, and EDNS-Client-Subnet is stripped so there is no per-subnet key explosion. The
+cache is `glcache` — an in-memory LRU in the Go heap (no disk; `cache_size` is a RAM byte-budget).
+
+**A/B (dnsperf replay of 25k real querylog names, 4,729 distinct, real popularity; UDP/53):**
+
+| metric | cache off | cache on | Δ |
+|---|---|---|---|
+| throughput | 16,438 qps | 26,241 qps | **+60%** |
+| avg latency | 18.1 ms | 11.2 ms | −38% |
+| queries reaching unbound | 289,538 | 5,439 | **−98%** |
+
+The looped replay compresses time, so its hit rate (~99%) overstates the organic 57%; the
+scale-invariant benefit is that **~57% of real queries now skip the upstream hop**. Crucially, cache
+hit rate *rises with traffic* (more users → more domain overlap), so this is the rare optimization
+that pays off **more** as the resolver grows — and it also blunts the cacheable-flood class (a
+repeated-domain flood is absorbed at the front). It does **not** help against cache-busting
+(random-subdomain) floods — that remains the WAF/rate-limit layer's job. unbound stays the deep
+cache (RRSET cache, prefetch, DNSSEC-validation cache, serve-stale); the AGH cache is just a fast
+hot-set skimmer in front.
+
 ---
 
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
@@ -1089,6 +1136,9 @@ top-level sections in `AdGuardHome.yaml`.
 | `quic_max_incoming_streams` | `64` | `[1, 1024]` or `0` | Max concurrent QUIC streams per connection for DoQ/DoH3. `0` silently maps to 64. Values outside `[1, 1024]` log a warning and fall back to 64. Introduced in schema v35. |
 | `upstream_timeout` | `1s` | any duration | Per-request upstream deadline. Should be set below dnscrypt-proxy's own timeout to avoid wasted post-deadline work. |
 | `max_goroutines` | `300` | positive int | Maximum parallel DNS request goroutines. |
+| `cache_enabled` | `true` | bool | AGH front-cache (§7.13). Enabled to skip the localhost hop to unbound for the hot set (~57% of organic queries). `glcache` in-memory LRU. |
+| `cache_ttl_min` | `0` | seconds | Minimum TTL AGH pins on cached answers. Kept at **0** so real upstream TTLs are respected — never pin short-TTL CDN/GSLB answers. |
+| `cache_size` | `4194304` | bytes | RAM byte-budget for the front-cache (heap, counts toward `GOMEMLIMIT`). Raise (e.g. 32–64 MB) as traffic grows so the hot set keeps fitting. |
 
 ### `http` section
 
@@ -1131,6 +1181,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-06-04 | **perf:** AGH front-cache **enabled** (`cache_enabled:true`, `cache_ttl_min:0`) — measured 57% organic hit rate; A/B replay of real querylog names **+60% throughput / −98% backend load**; DNSSEC-safe, respects real TTLs; hit-rate rises with traffic so it scales with growth (§7.13). Plus `filtering.BlockedResponseTTL` exclusive-lock→`RLock` fix (was 86% of mutex delay under cache-on load once the cache made the rest fast) (§7.12) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** plain-upstream **connection pooling** (dnsproxy fork `7363632`) — reuse UDP/TCP upstream connections instead of dial-and-close per query; eliminated the ~19% per-query `connect()` CPU the post-lock profile exposed. A/B: goodput **+40…+101%** across the c=100…600 ramp (≈doubled at c=400/600), c=600 canary 306→151 ms (§8.1). Also pinned `GOMEMLIMIT=380 MiB` below the cgroup `MemoryHigh=400 MiB` so Go GC precedes kernel reclaim (§10) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** goodput-collapse trilogy — three per-query serve-path locks removed in profile-named order (query-log `bufferLock` → async single-consumer; statistics `currMu` → 16-way sharded unit; client `Storage.UpdateAddress` write-storm → bounded per-IP WHOIS dedup cache). Total mutex-wait delay under a c=500 DoT flood **3,470 s → 15.75 s (−99.5%)**; zero goroutines park on a lock (lock-bound collapse → CPU-bound); real-user tail latency at c=600 **869 ms → 163 ms** (§7.11) |
 | `v0.107.77-edge` | 2026-06-03 | **feat:** shield real-time per-query feed (`qfeed`) — a 36-byte fire-and-forget unix-datagram event per query (XXH3 name *hash* only; the name never leaves the host), non-blocking lock-free emit with drop-on-backpressure shedding, replacing the WAF's flush-lagged querylog tail with a live `Do53`/`DoT`/`DoQ`/`DoH` window (§7.10) |
