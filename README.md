@@ -1268,6 +1268,56 @@ was **rejected** and the ablation reverted; nothing shipped.
 > on the same 4 cores); finding AGH's *true* internal ceiling needs an **off-box load generator** so AGH
 > owns all cores. Until then, the four shipped wins (§8.2–8.4, §7.14) are the harvest.
 
+### 8.6 The Test-Harness Ceiling — Measured AGH Capacity is ≈ 2× the Observed Numbers (2026-06-05)
+
+Every throughput number in §8.2–§8.5 was measured with the load generator (`dnsperf`) **on the same
+4-core box** as the resolver, driving traffic over loopback. The CPU census in §8.5 hinted at the problem;
+two follow-up measurements proved it and **reframe the entire campaign upward.**
+
+**Measurement 1 — sub-saturation CPU sweep.** Driving rate-capped loads (`dnsperf -Q`) and sampling AGH's
+own CPU at each rate:
+
+| target qps | achieved | AGH CPU | box idle | µs/query (avg) |
+|---|---|---|---|---|
+| 4,000 | 3,909 | 82% | 43% | 209.8 |
+| 8,000 | 7,783 | 132% | 25% | 169.6 |
+| 16,000 | 15,827 | 147% | 4% | 92.9 |
+| 20,000 | 18,669 | 156% | 3% | 83.6 |
+
+The falling µs/query is a fixed-cost artifact (≈0.6 core of rate-independent background — 4 UDP reader
+loops, stats, qfeed, GC — amortizing over more queries); the **marginal** per-query cost from the slope is
+**~50–54 µs**. The decisive observation: when the **box** saturates (idle → ~2-4% at ~18.7k qps), **AGH is
+using only ~1.5 cores.** The other ~2.5 cores are the generator plus the loopback kernel netstack
+(`sys`+`softirq`). And the ceiling moves with the *generator's* config — `-c8 -q800` reaches 28k, `-c4 -Q`
+tops out at ~18.7k for the *same resolver* — the tell-tale sign that **the load tool, not AGH, is the limit.**
+
+**Measurement 2 — CPU-pinned isolation (the clean read).** Pin AGH to 2 cores, `dnsperf` to the other 2:
+
+| config | achieved qps | AGH CPU | box idle | per-core |
+|---|---|---|---|---|
+| AGH on 2 cores (saturated) | **23,988** | 192% / 200% | **22%** | **~12,500 qps/core** |
+
+AGH **saturated its 2 cores (96%) and served ~24k qps with 22% of the box still idle** — i.e., AGH itself
+was the bottleneck on that 2-core budget, cleanly isolated from the generator. Per core ≈ **12.5k qps**
+(the sweep independently gave ~11.7k/core). Extrapolated to all 4 cores:
+
+> **AGH true ceiling ≈ 50,000 qps** (flat per-core scaling) **to ≈ 62,000 qps** (fixed-cost-amortized model:
+> 62% fixed + ~54 µs/query marginal). **≈ 2× the ~28k the co-located harness ever exposed.**
+
+**What this means for §8.2–§8.5.** Every win was measured through a rig that handed AGH only ~half the
+machine. The +5–12% deltas are therefore **understated** — on un-confounded hardware the same per-query
+savings ride a ~50–60k ceiling, not a ~28k one. It also recolors the two "null" results honestly: the §8.4
+cache-shard reading "throughput-flat" and the §8.5 recursion-detector "phantom" verdict are correct **for
+this rig**, where AGH never runs hot enough to stress those locks — but at a real ~50k load some of them
+(cache `get`, recursion detector) could re-emerge. They are not bottlenecks at 28k; they are unproven at 55k.
+
+**The honest ceiling number is a load-generation problem, not a resolver problem.** To *drive* AGH to its
+real ceiling and re-hunt locks there, the generator must stop stealing the resolver's cores: an off-box
+client, or an on-box **AF_XDP generator over a veth pair** (reclaims the generator's ~1 core of netstack
+cost; the box already runs a patched xdp-tools data-plane in shield), or at minimum a `sendmmsg`-batched
+generator with CPU-pinning. Until then, **~12.5k qps/core is the durable, harness-independent capacity
+figure** — and it says the resolver has roughly twice the headroom the raw benchmark rows imply.
+
 ### Consolidated Benchmark Results
 
 All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
