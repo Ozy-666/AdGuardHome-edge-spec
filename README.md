@@ -1168,6 +1168,36 @@ collapse is gone — and tail latency under load fell **−53%** (1.75 s → 0.8
 blocking on the shared write lock disappeared. Naturally bounded at core count; more sockets than cores
 adds reader goroutines without splitting more work. Upstreamable to dnsproxy as an opt-in. (fork `3927e02`)
 
+### 8.4 Request-Cache Sharding (2026-06-05)
+
+With the serve-path locks (§7.11), the debug-log serialization (§8.2), and the UDP write `fdMutex`
+(§8.3) all removed, a fresh mutex profile put the **single response cache** at the top: `proxy.(*cache).
+set` took a global `itemsLock` *exclusively* on every store (blocking all readers), and even reads
+serialized on the underlying glcache's own mutex (an LRU reorders on every `Get`). Together ~62% of
+mutex-delay in the instrumented profile.
+
+**Fix.** Stripe the main requests cache into a power-of-two number of shards (default 16), each with its
+own `RWMutex` and LRU, selected by a `maphash` of the cache key. The shard count adapts *down* so every
+shard's `MaxSize` still admits a full-size DNS message (glcache caps element size at the shard size), and
+an unsized or small cache stays single — byte-for-byte the previous behavior. The cold EDNS-CS cache is
+left unsharded (its longest-prefix lookup probes several keys per get, which doesn't fit single-key
+striping). Override via `DNSPROXY_CACHE_SHARDS` (`=1` disables). Race-clean under `go test -race`.
+
+**Result — honest:** re-profiled, `proxy.(*cache).set`/`get` are **gone** from the mutex profile; the
+lock is provably eliminated. But end-to-end throughput is **flat** at the tested loopback load
+(standard +4% with max latency halved 2.01 s → 1.02 s; heavy −2.8% — all inside run-to-run variance).
+The ~62% figure was inflated by pprof's own mutex instrumentation; **without** it the box is not
+cache-lock-bound at this load, so splitting the lock removes the contention and adds headroom without
+raising the ceiling *here*. Kept because it is correct, low-risk, transport-independent (DoT/DoH hit the
+same cache), and provides headroom for higher-concurrency regimes — not because it moved throughput
+today. This is the honest shape of a contention fix on a path that isn't currently the bottleneck.
+(fork `6645070`)
+
+> **Method note.** This is why each lever is profiled *after* the previous one ships: removing the §8.3
+> `fdMutex` reshuffled the contention ranking and surfaced the cache lock; removing the cache lock in turn
+> surfaced per-query client-IP processing (`DefaultAddrProc`, ~52%) and the recursion-detector cache as
+> the next contenders. Mutex-profile percentages are contention *rank*, not a throughput promise.
+
 ### Consolidated Benchmark Results
 
 All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
