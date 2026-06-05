@@ -1226,6 +1226,48 @@ today. This is the honest shape of a contention fix on a path that isn't current
 > surfaced per-query client-IP processing (`DefaultAddrProc`, ~52%) and the recursion-detector cache as
 > the next contenders. Mutex-profile percentages are contention *rank*, not a throughput promise.
 
+### 8.5 Rejected: Recursion-Detector Cache Shard — a Profiler Phantom (2026-06-05)
+
+After §7.14, the mutex profile pointed hard at the next target: `proxy.(*recursionDetector).check` →
+`golibs/cache.(*cache).Get` at **83.74% of mutex-delay**. The recursion detector keeps a small LRU
+(`MaxCount: 1000`) of recently-forwarded request signatures to break forwarding loops, and it is checked
+*and* updated on every query — an LRU `Get` is a write under the hood (it reorders), so it serializes on
+the cache's internal mutex. The obvious move was to reuse the §8.4 shard pattern on it. **We did not — the
+data said it would be wasted effort.**
+
+**Clean-room discipline (no patch yet).** With pprof fully off, a heavy baseline (`-c8 -q800 -l30`) held at
+**28,152 qps**, and a scaling probe (`-c16 -q1600`) gave **+0% qps for +2× latency** — the shape of a
+plateau. But a per-process CPU census exposed the real story: the 4-core box ran at **~0% idle** while
+**AdGuardHome used only ~2.4 cores** — the co-located `dnsperf` (~0.8–1.1 cores) and the loopback kernel
+network stack (`sys` ~35% + `softirq` ~11%, ~1.8 cores) ate the rest. AGH wasn't lock-bound; it was
+**CPU-starved by the test rig**. A lock ceiling looks like *parked goroutines with idle cores to spare* —
+the opposite of what we measured.
+
+**The decisive test — ablation.** Stubbing `check`→`false` and `add`→no-op (a full bypass of the cache,
+the absolute upper bound of any optimization) and re-running the identical load:
+
+| metric | clean baseline | recursion detector **fully bypassed** | Δ |
+|---|---|---|---|
+| heavy qps | 28,152 | 28,990 | **+3.0% (within ±3–4% run noise)** |
+| avg latency | 28.28 ms | 27.45 ms | −2.9% |
+| tail (max) latency | 2.07 s | 2.05 s | flat |
+| AGH CPU | ~245% | ~245% | flat |
+| box idle | ~0% | ~0% | saturated |
+
+**Deleting the detector entirely buys nothing measurable.** Since that is the ceiling on any change to this
+code, *sharding* it — which keeps the work and only splits the lock — would yield strictly less. The
+83.74% was a **profiler phantom**: `runtime.SetMutexProfileFraction(1)` inflates an otherwise-cheap LRU
+mutex into the top of the *instrumented* delay graph, but it costs ~zero physical throughput. The change
+was **rejected** and the ablation reverted; nothing shipped.
+
+> **Lesson.** A mutex profile ranks *where goroutines wait when you ask them to record waiting*, not where
+> the wall-clock ceiling is. Two independent guards catch the phantom: (1) **read CPU idle** — if the box
+> is saturated and the process is *not* at full cores, the limit is the rig/CPU, not the lock; (2)
+> **ablate before you optimize** — if removing the code outright doesn't move throughput, neither will a
+> cleverer lock. The honest ceiling on this loopback rig is the harness itself (AGH + generator + kernel
+> on the same 4 cores); finding AGH's *true* internal ceiling needs an **off-box load generator** so AGH
+> owns all cores. Until then, the four shipped wins (§8.2–8.4, §7.14) are the harvest.
+
 ### Consolidated Benchmark Results
 
 All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
