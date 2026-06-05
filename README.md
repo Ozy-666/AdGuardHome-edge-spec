@@ -1136,6 +1136,38 @@ rather than a proportional qps jump. Under a CPU-bound flood the same ~11% would
 capacity. The durable result is structural: a provably-dead serialization is no longer executed on the
 serve path. Strictly an improvement, upstreamable to dnsproxy. (fork `1e17078`)
 
+### 8.3 UDP Listener Sharding — SO_REUSEPORT per Core (2026-06-05)
+
+dnsproxy listened on a **single** UDP socket per address, with one reader goroutine and — more
+importantly — one writer path. Every response `sendmsg` took that socket's `internal/poll.fdMutex`
+write lock, so all concurrent in-flight responses serialized through a single mutex. A block profile
+under load put `(*fdMutex).rwlock` at **~43% of all block-delay** — the dominant contention point once
+the §7.11 serve-path locks and §8.2 logging were gone. The throughput signature was unmistakable: a
+**heavier** concurrency level produced **lower** throughput than a lighter one (28,143 vs 30,339 qps),
+the classic shape of a saturating lock.
+
+**Fix.** Open `GOMAXPROCS` UDP sockets per listen address instead of one. `SO_REUSEPORT` is already set
+on every socket by dnsproxy's `ListenConfig`, so the sockets co-bind the same `[::]:53` and the kernel
+fans inbound datagrams across the independent file descriptors by flow hash. `server.go` already starts
+one `udpPacketLoop` per socket, and each response is written back on the socket its query arrived on
+(`DNSContext.Conn`), so the per-fd write lock splits N ways for both read and write. Source-address
+correctness on the unspecified bind is preserved per-socket via the existing OOB `localIP` path.
+Override via `DNSPROXY_UDP_SHARDS` (`=1` restores the single-socket upstream behavior); default is
+`GOMAXPROCS` (4 here).
+
+**Result (A/B, loopback dnsperf, single socket vs 4 sockets, deployed):**
+
+| load | qps before | qps after | Δ qps | avg lat before | avg lat after | tail (max) before | tail after |
+|---|---|---|---|---|---|---|---|
+| standard (`-c4 -q300`) | 30,339 | 31,463 | **+3.7%** | 9.73 ms | 9.32 ms | 1.70 s | 1.80 s |
+| heavy (`-c8 -q800`) | 28,143 | 31,351 | **+11.4%** | 28.28 ms | 25.39 ms | 1.75 s | **0.82 s** |
+
+0 loss throughout. The structural win is clearest in the heavy column: before, heavy throughput
+*collapsed below* standard (the contended single lock); after, heavy ≈ standard (31,351 ≈ 31,463) — the
+collapse is gone — and tail latency under load fell **−53%** (1.75 s → 0.82 s) as the head-of-line
+blocking on the shared write lock disappeared. Naturally bounded at core count; more sockets than cores
+adds reader goroutines without splitting more work. Upstreamable to dnsproxy as an opt-in. (fork `3927e02`)
+
 ### Consolidated Benchmark Results
 
 All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
