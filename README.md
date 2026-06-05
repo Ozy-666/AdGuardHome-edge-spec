@@ -1044,6 +1044,34 @@ repeated-domain flood is absorbed at the front). It does **not** help against ca
 cache (RRSET cache, prefetch, DNSSEC-validation cache, serve-stale); the AGH cache is just a fast
 hot-set skimmer in front.
 
+### 7.14 Lock-Free Per-Query Client-IP Enqueue (2026-06-05)
+
+With the serve-path, UDP, and cache locks gone, a mutex profile put
+`client.(*DefaultAddrProc).Process` at the top (~52% of mutex-delay). That method runs on **every**
+query to hand the client IP to the background rDNS/WHOIS enrichment worker, and it took a global
+`sync.Mutex` for one reason: to stop a concurrent `Close` from closing the queue channel mid-send (a
+send on a closed channel panics). So every query goroutine serialized on a single lock to do a
+nanosecond channel push.
+
+**Fix.** Apply the standard multi-sender/one-closer pattern: never close the data channel from the
+senders. Shutdown is signaled by closing a separate `closed` channel (once, via `sync.Once`); the
+worker `select`s on it, drains the queue, and exits, while `Process` becomes a lock-free non-blocking
+`select` over *send / closed / default-drop*. The queue-full drop counter and the
+`ErrClosed`-on-double-close contract are preserved, and the change is race-clean under `go test -race`.
+
+**Result (A/B, loopback dnsperf, before vs after, deployed):**
+
+| load | qps before | qps after | Δ qps | avg before | avg after | tail (max) before | tail after |
+|---|---|---|---|---|---|---|---|
+| standard (`-c4 -q300`) | 27,788 | 31,302 | **+12.6%** | 10.62 ms | 9.36 ms | 1.69 s | **0.67 s** |
+| heavy (`-c8 -q800`) | 28,144 | 28,969 | **+2.9%** | 28.29 ms | 27.48 ms | 2.04 s | **0.79 s** |
+
+0 loss. The standout is **tail latency: −60% on both load levels** (max ~1.7–2.0 s → sub-second) — the
+per-query head-of-line stalls on the global lock are gone. Re-profiled, `DefaultAddrProc.Process` is
+absent from the mutex profile; the next contender is dnsproxy's recursion-detector cache
+(`recursionDetector.check`). Unlike the cache shard (§8.4), this lock sat on the unconditional per-query
+path, so removing it moved real throughput and latency, not just the profile. (AGH `58fc05a8`)
+
 ---
 
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
