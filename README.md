@@ -1367,6 +1367,42 @@ The harness lives in `xdp-loadgen/` (`topology.sh`, `blaster.c`, `xdp_drop.bpf.c
 down cleanly (netns + veth + nft whitelist all removed). Headline: **the edge resolver does enterprise-grade
 ~50k qps clean / ~62k peak on four cores.**
 
+### 8.8 The Full Ceiling Map — Cache-Hit vs Forwarding, and What Actually Bounds It (2026-06-05)
+
+With the harness in hand, two follow-ups: what does a *realistic* (cache-missing) load do, and at the real
+ceiling, what is the actual bottleneck?
+
+**(a) Cache-hit vs forwarding ceilings** (same AF_XDP harness, real querylog domains):
+
+| traffic | peak goodput | bound by |
+|---|---|---|
+| cache-hit (one hot name) | ~50k clean / ~62k peak | AGH CPU (~3.2 cores) |
+| real 25k-domain working set, **cache ON** | **50,024 @ 0.2% loss** | still cache (unbound stayed at **0% CPU** — the working set is cache-resident) |
+| **cache OFF, every query → unbound** | **~26k** (collapses past ~40k offered) | the upstream round-trip + unbound, *not* AGH (AGH only ~2.5 cores) |
+
+The middle row is the important real-world result: a production-representative working set **fits the 8 MB
+front-cache**, so steady-state traffic is ~100% hits and serves the full ~50k. The forwarding path (every
+query a miss) tops out near **~26k**, limited by the AGH→unbound round-trip, not AGH's own CPU. Real
+production (≈57% hit) therefore lands **between**, ~35–45k qps — still well above the old 28k loopback figure.
+
+**(b) What bounds AGH at its ceiling** (pprof CPU/mutex/block captured under a sustained ~55k AF_XDP load —
+AGH served **54,921 qps even with the mutex profiler running**):
+
+- **Block profile: 93% in `respondUDP → UDPWrite → sendmsg`.** The per-response **UDP write syscall** is where
+  goroutines spend their blocked time — the dominant serialization at the ceiling, even across 4 SO_REUSEPORT
+  sockets.
+- **CPU: ~27% in syscalls** (sendmsg/recvmsg), then stats (11%), `mallocgc` (11%), filtering (9.5%),
+  cache-get (9%). The cost is **I/O and allocation, not locks.**
+- **The recursion-detector lock is a confirmed phantom at 2× load.** It is **40% of mutex-delay** yet
+  **absent from the CPU profile (~0%)** — contended-but-cheap, exactly as §8.5's ablation showed at 28k.
+  AGH sustaining 55k *with* mutex profiling on is the proof it isn't the limiter.
+
+> **Conclusion: at ~55k the resolver is UDP-syscall/I-O-bound, not lock-bound.** The lock-removal campaign
+> (§7.11–§7.14, §8.2–§8.4) took AGH as far as the per-query *compute* path usefully goes; the locks that
+> remain in the mutex ranking cost no CPU and cap nothing. The next real frontier is the **per-packet
+> syscall** — `sendmmsg`/`recvmmsg` batching or `io_uring` to amortize the write path — a transport-layer
+> rearchitecture, not another mutex. That is the honest end of the lock-contention thread.
+
 ### Consolidated Benchmark Results
 
 All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
