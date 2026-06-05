@@ -1318,6 +1318,55 @@ cost; the box already runs a patched xdp-tools data-plane in shield), or at mini
 generator with CPU-pinning. Until then, **~12.5k qps/core is the durable, harness-independent capacity
 figure** — and it says the resolver has roughly twice the headroom the raw benchmark rows imply.
 
+### 8.7 Proving the Ceiling — the AF_XDP/veth Load Harness (2026-06-05)
+
+§8.6 *extrapolated* AGH's ceiling at ~50–60k qps. This section *measured* it, by building a load
+generator lean enough to stop stealing the resolver's cores.
+
+**Topology.** A `veth` pair bridges a generator network namespace to the host: `veth_gen` (10.0.0.2,
+inside `test_ns`) ↔ `veth_agh` (10.0.0.1, host). AGH already listens on `0.0.0.0:53`, so it serves on
+`veth_agh` through the *normal* netstack — its real per-query cost is preserved. A custom **AF_XDP TX
+blaster** (C, libxdp, SKB/copy mode since veth has no zero-copy) pre-crafts a complete Ethernet+IP+UDP+DNS
+`A?` frame and injects it straight into the TX ring, bypassing the generator's userspace stack. An
+**`XDP_DROP`** program on `veth_gen` discards AGH's replies at the driver, so the generator never pays a
+receive cost. Static neighbor entries let AGH complete its real response `sendmsg` (the reply is then
+dropped at `veth_gen`).
+
+**Two traps worth recording.** (1) AGH's reply path needs a static `neigh` for 10.0.0.2, else the queries
+are processed but `XDP_DROP` eats the ARP and no reply is emitted. (2) **shield's own nft anti-DDoS ate the
+test traffic** — a single-source blaster trips the per-IP `30 qps` limiter in `raw_filter` `prerouting`
+(priority `raw`, *before* the `protection input` chain), which autobans the source into `@dns_bad_ip` for
+30 min. The fix is an `iifname "veth_agh" accept` at the top of *both* chains — the private veth subnet is
+trusted exactly like `lo`/`tailscale0`. (A useful incidental proof that the WAF works.)
+
+**Result — rate sweep, goodput = `veth_agh` `txpck/s` (replies AGH actually served), cloudflare.com cached:**
+
+| offered qps | goodput (served) | loss | AGH CPU | blaster CPU | box idle |
+|---|---|---|---|---|---|
+| 20,000 | 19,972 | 0% | 0.97 core | 0.09 core | 61% |
+| 40,000 | 39,999 | **0%** | 2.04 core | 0.27 core | 31% |
+| 50,000 | **50,005** | **0.1%** | 2.97 core | 0.27 core | 14% |
+| 60,000 | 58,605 | 2.3% | 3.23 core | 0.27 core | 3% |
+| 75,000 | **61,923** (peak) | 17% | 3.23 core | 0.33 core | 2% |
+| 110,000 | 52,868 (collapsing) | 52% | 3.07 core | 0.50 core | 3% |
+
+> **AGH served 50,005 qps at 0.1% loss, and peaks at ~62k qps, on a 4-core box** — and the real-user canary
+> stayed green throughout, even under the 110k-pps onslaught. Beyond ~75k offered, goodput **collapses**
+> (more offered → less served), the signature of an overloaded UDP receive path.
+
+**This confirms §8.6 and overturns the ~28k loopback number — AGH's true ceiling is ~2.2× higher.** The
+mechanism is exactly as predicted: the **blaster costs ~0.27 core at 60k pps** vs dnsperf's ~0.8–1.1 core,
+so AGH gets ~3.2 cores of the box instead of ~1.6. AGH is CPU-bound at ~3.2 cores (the remaining ~0.8 is
+kernel softirq + the light generator) — it never starves on a lock, vindicating the §8.4/§8.5 "those locks
+aren't the bottleneck *here*" calls while showing the headroom is real.
+
+**Honest scope.** This is the **cache-hit serving ceiling** (a single hot name served from AGH's cache —
+the fast path, no upstream). It is the right "max capacity" figure (and ~57% of real traffic is cache
+hits), but a fully cache-missing mix that forwards every query to unbound would serve fewer qps per core.
+The harness lives in `xdp-loadgen/` (`topology.sh`, `blaster.c`, `xdp_drop.bpf.c`, `sweep.sh`) and tears
+down cleanly (netns + veth + nft whitelist all removed). Headline: **the edge resolver does enterprise-grade
+~50k qps clean / ~62k peak on four cores.**
+
 ### Consolidated Benchmark Results
 
 All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
