@@ -1093,6 +1093,49 @@ concurrency level and are reused, instead of churning thousands of dials per sec
 is genuine work: the downstream TLS response write (~36%) and the upstream exchange (~31%) — the
 irreducible floor for a forwarding resolver without front-end caching.
 
+### 8.2 Debug-Log Serialization Off the Hot Path (2026-06-05)
+
+A CPU profile of the cache-on resolver under a plain-UDP flood (loopback `dnsperf`, 25.8k qps, 0 loss)
+showed `(*Proxy).logDNSMessage` at **~11% of all CPU** — `~14%` of the per-query pipeline — dominated by
+`miekg/dns.(*Msg).String()` (the full text serialization of the message) plus the string-concat
+allocations feeding it. The function ran on the hot path of *every* query:
+
+```go
+// before — proxy/server.go
+slogutil.PrintLines(ctx, p.logger, slog.LevelDebug, msg, m.String())
+```
+
+`m.String()` was evaluated **unconditionally and twice per query** (once for the request, once for the
+response), then handed to a `LevelDebug` log call that discards it whenever debug logging is off — the
+production default (`verbose: false`). The handler dropped the string, but the work to build it was
+already spent.
+
+**Fix.** Guard the serialization behind the standard slog level check, so the message is never stringified
+unless a debug sink is actually listening. Behavior is byte-for-byte identical when `verbose: true`.
+
+```go
+// after
+if !p.logger.Enabled(ctx, slog.LevelDebug) {
+	return
+}
+```
+
+**Result (A/B, identical UDP loopback load, before vs after, deployed):**
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| throughput | 25,774 qps | 27,161 qps | **+5.4%** |
+| avg latency | 11.49 ms | 10.84 ms | **−5.7%** |
+| loss | 0 | 0 | — |
+| `logDNSMessage` in CPU profile | ~11% of total | **absent** | path eliminated |
+
+Re-profiled, `logDNSMessage` and `Msg.String()` are **gone** from the CPU graph. The throughput/latency
+gain is modest because this generator is concurrency-capped (`-q 300`), not CPU-saturated — the box ran
+at ~236–257% of 400% in both runs, so the reclaimed CPU surfaces as lower per-query latency and headroom
+rather than a proportional qps jump. Under a CPU-bound flood the same ~11% would surface directly as
+capacity. The durable result is structural: a provably-dead serialization is no longer executed on the
+serve path. Strictly an improvement, upstreamable to dnsproxy. (fork `1e17078`)
+
 ### Consolidated Benchmark Results
 
 All benchmarks run on AMD EPYC 7542, 4 parallel goroutines,
