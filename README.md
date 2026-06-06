@@ -1074,6 +1074,56 @@ path, so removing it moved real throughput and latency, not just the profile. (A
 
 ---
 
+### 7.15 Defense-in-Depth: DNS QName Sanity Guard & Stats Pollution Watchdog (2026-06-06)
+
+A WebUI report turned into a forensic case study. The dashboard's *top queried / blocked domains*
+briefly listed entries like `www.google.com\ a`, `gc.kis.v2.scr.kaspersky-labs.com\ https`,
+`49.98.30.81.in-addr.arpa\ ptr` — a domain with its **own lowercased query type** glued on after a
+`\ ` separator. It appeared under heavy load and cleared on its own.
+
+**Forensics (the interesting part).** Every layer was cross-checked rather than guessed at:
+
+- *Real, not a render artifact.* A hexdump of `stats.db` showed the literal bytes `…com` `5c`(`\`)
+  `20`(space) `61`(`a`). The `\ ` is exactly how miekg's `sprintName` escapes a 0x20 space byte. The
+  dirty keys had been flushed to bbolt and now survive only in **freed pages** — every *live* hourly
+  bucket decoded 100% clean (verified with a bbolt + gob walker; unit id = hours-since-epoch). The
+  query log showed the same `\ a` before its in-RAM file rotated the incident entries out.
+- *A Go-level concatenation, not a buffer/wire bug.* The wire qtype is **binary** (`0x0001` for `A`),
+  never the ASCII text `a`/`https`/`srv`. So the type text can only originate from a Go
+  `name + " " + dns.Type(qt).String()` concatenation reaching `dnsContext.normalizedName`
+  (`NormalizeDomain(q.Name)`), then lowercased. This **excluded** any packet-buffer corruption — and,
+  notably, exonerated an in-flight `recvmmsg` read-path experiment (§8.9). With no `unsafe` string
+  conversions anywhere in AGH and a single `stats.Update` caller, `normalizedName` is a safe immutable
+  string and the *only* stats-domain source; so `q.Name` itself was `name<space>TYPE` for a small
+  **race subset** (~199 of ~14 M queries), only during the load window.
+- *Functional, not cosmetic.* A crafted query with an embedded-space qname returns **SERVFAIL** —
+  malformed-name queries fail to resolve — a plausible contributor to the resolution slowness observed
+  during the window.
+- *Not reproducible* on the shipped build afterward (heavy DoT, DoH-over-socket, UDP, and a full
+  AF_XDP-blaster + DoT + DoH storm all stayed clean). A genuine transient.
+
+**The defense (shipped).** A malformed name could not be root-caused by reading alone, so rather than
+guess, two cheap **defense-in-depth guards** convert a silent heisenbug into a catchable one. A
+normalized DNS name can never legitimately contain a space, so the condition is unambiguous:
+
+- *AdGuard Home* — `dnsforward.sanitizeNormalizedName` (`e89d326d`): on every request, if the
+  normalized question name contains a space, **trim** the qtype suffix (and a preceding escape
+  backslash) so stats and the query log keep correct keys, and **log** the raw name, qtype and
+  transport (exponentially sampled). A single byte-scan on the hot path; it cannot affect valid
+  traffic.
+- *dnsproxy* — `Proxy.logMalformedQName` (`71dc552`): at the single post-`Unpack` chokepoint
+  (`handleDNSRequest`, all transports), the same space check logs WARN with the raw name, qtype,
+  `DNSContext.Proto` **and client address**. Behavior is unchanged; it exists purely so a real
+  recurrence pins the exact offending **transport** and **upstream handler**.
+
+Both were verified to fire and sanitize against a crafted embedded-space query (`proto=udp`). The
+lesson is the method as much as the fix: **prove the layer with a hexdump before theorizing**, use an
+*impossible-by-construction* invariant (no spaces in a normalized name) as the guard condition, and
+when a race can't be reproduced, ship a sampled watchdog that captures the producing context instead
+of a speculative rewrite.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -1414,6 +1464,34 @@ typical NXDOMAIN/A-record response.
 | TCP round-trip (read+write) | — · ~512 B · **4 allocs** | ~251 ns · **0 B** · **0 allocs** | −4 allocs · −512 B |
 | Server state check | RLock/RUnlock on every keepalive | Atomic load (no lock) | Thundering-herd on shutdown eliminated |
 | Upstream weight calculation | Exclusive mutex on every query | Atomic pointer load (no lock) | Contention at dispatch point eliminated |
+
+---
+
+### 8.9 Rejected: recvmmsg Read-Path Batching — Measured, Not Worth It (2026-06-06)
+
+§8.8 named per-packet syscall batching as the only remaining transport lever once the lock-contention
+thread closed. The write side (`sendmmsg`) had already been micro-benchmarked at ~24% raw-send /
+≈4% total CPU — modest, and it adds response latency. The **read** side was the cleaner candidate:
+`udpPacketLoop` already runs one loop per socket, so coalescing receives needs no cross-goroutine queue
+and adds no latency.
+
+Implemented as `UDPBatchReader` over `ipv4.PacketConn.ReadBatch` (poller-integrated `recvmmsg`,
+`flags=0` = drain only what is already queued, so the netpoller still blocks only until the first
+datagram), gated by `DNSPROXY_UDP_RECV_BATCH` (default 16, `=1` restores single-read). A/B'd honestly
+on the §8.7 AF_XDP harness:
+
+| offered | 4 SO_REUSEPORT shards (prod) | 1-shard funnel |
+|---|---|---|
+| 35 k | batch off ≈196% → on ≈175% CPU (noise) | off ≈170% → on ≈195% (**worse**) |
+| 45 k | off ≈236% → on ≈242% (flat) | off ≈208% → on ≈227% (**worse**) |
+
+The decisive test is the **1-shard funnel** — the configuration that *should* favor batching (a deep
+per-socket backlog) — where it was flat-to-**worse**: `x/net`'s `ReadBatch` carries per-message
+overhead (`mmsghdr` pack/unpack, a per-datagram sockaddr allocation) that eats the saved syscalls. No
+throughput or ceiling change anywhere. This confirms §8.8's verdict that the cost is the **write** path
+(`sendmsg`, 93% of block-delay) plus per-packet kernel work, not read syscalls. **Reverted**, recorded
+like §8.5. The `sendmmsg`/`recvmmsg` syscall-batching thread is now closed in both directions — measure
+before rearchitecting, both times.
 
 ---
 
