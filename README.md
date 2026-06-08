@@ -1493,6 +1493,33 @@ throughput or ceiling change anywhere. This confirms §8.8's verdict that the co
 like §8.5. The `sendmmsg`/`recvmmsg` syscall-batching thread is now closed in both directions — measure
 before rearchitecting, both times.
 
+### 8.10 Client-reset write-errors logged at Debug, not Error
+
+A shield siege test surfaced a self-inflicted CPU sink that fired **exactly when the box is under
+attack**. Under a DoT/DoQ flood (~95 k req/s, ~400 pipelined clients that hang up mid-response),
+the dnsproxy response-write path logs one line per client that drops before AGH finishes writing:
+
+```
+[error] dnsproxy: responding request proto=tls err="writing message: write tcp …: write: connection reset by peer"
+```
+
+At that load this is ~10 k lines/min, which spiked **systemd-journald to ~45% CPU** — a whole core
+spent on *logging benign client hangups* during the flood (it showed up as a post-siege catch-up
+flush because journald was CPU-starved at 0% idle during the attack itself).
+
+These resets are not a server fault: a flooding, pipelined, or cancelled client simply closes
+before the response is written. dnsproxy's `logWithNonCrit` already downgrades `io.EOF`,
+`net.ErrClosed`, `EPIPE` (broken pipe), and timeouts to **Debug** — but **`ECONNRESET`
+("connection reset by peer") was the missing case**, so it alone escaped to Error. Fixed in the
+dnsproxy fork (`b74b7bb`) by adding an `isECONNRESET` helper (parallel to the existing `isEPIPE`,
+with a Plan 9 string variant) to that same Debug branch. Typed `errors.Is(err, syscall.ECONNRESET)`
+unwrapping is used rather than substring matching, and genuine non-client write errors stay at
+Error so real problems still surface.
+
+A journald rate-limit on the shield box (`LogRateLimitIntervalSec=10s` / `LogRateLimitBurst=500`,
+verified to cap 10 k → 500 lines and bring journald CPU 45% → 0%) was the prod stopgap; with the
+fork logging resets at Debug it becomes belt-and-suspenders rather than load-bearing.
+
 ---
 
 ## 9. Security Hardening
@@ -1569,6 +1596,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-06-08 | **resilience:** client connection-reset write-errors logged at **Debug, not Error** (dnsproxy fork `b74b7bb`) — a DoT/DoQ flood of pipelined clients that hang up mid-response was emitting ~10 k ERROR lines/min, spiking systemd-journald to **~45% CPU during the attack**. `logWithNonCrit` already downgraded EOF/`ErrClosed`/EPIPE/timeout; `ECONNRESET` was the missing case. Added `isECONNRESET` to that Debug branch; genuine write errors stay at Error (§8.10) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** AGH front-cache **enabled** (`cache_enabled:true`, `cache_ttl_min:0`) — measured 57% organic hit rate; A/B replay of real querylog names **+60% throughput / −98% backend load**; DNSSEC-safe, respects real TTLs; hit-rate rises with traffic so it scales with growth (§7.13). Plus `filtering.BlockedResponseTTL` exclusive-lock→`RLock` fix (was 86% of mutex delay under cache-on load once the cache made the rest fast) (§7.12) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** plain-upstream **connection pooling** (dnsproxy fork `7363632`) — reuse UDP/TCP upstream connections instead of dial-and-close per query; eliminated the ~19% per-query `connect()` CPU the post-lock profile exposed. A/B: goodput **+40…+101%** across the c=100…600 ramp (≈doubled at c=400/600), c=600 canary 306→151 ms (§8.1). Also pinned `GOMEMLIMIT=380 MiB` below the cgroup `MemoryHigh=400 MiB` so Go GC precedes kernel reclaim (§10) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** goodput-collapse trilogy — three per-query serve-path locks removed in profile-named order (query-log `bufferLock` → async single-consumer; statistics `currMu` → 16-way sharded unit; client `Storage.UpdateAddress` write-storm → bounded per-IP WHOIS dedup cache). Total mutex-wait delay under a c=500 DoT flood **3,470 s → 15.75 s (−99.5%)**; zero goroutines park on a lock (lock-bound collapse → CPU-bound); real-user tail latency at c=600 **869 ms → 163 ms** (§7.11) |
