@@ -651,6 +651,41 @@ config under the real systemd/AppArmor context, not a minimal one, before a swap
 broken zone (`dnssec-failed.org`) is correctly rejected (`SERVFAIL`). Validation
 behaviour is identical to the OpenSSL build — only faster.
 
+### 6.7 Layer Recheck — Libtool-Wrapper Trap & the June 2026 OpenSSL Advisory (2026-06-10)
+
+A scheduled recheck of the unbound + BoringSSL layer. The healthy parts first:
+unbound 1.25.1 is the current upstream release; the daemon runs BoringSSL from
+`/opt/boring` under an enforcing AppArmor profile (the §6.3 rule intact), with
+the jemalloc preload active; DNSSEC validation re-verified live (`ad` on clean
+chains, `SERVFAIL` on dnssec-failed.org); RFC5011 keeps `root.key` fresh
+in-daemon. BoringSSL's pin was 81 commits behind master with nothing
+security-relevant pending — notably, upstream explicitly documents BoringSSL as
+**not affected** by the OpenSSL security advisory of June 9th, 2026
+(**CVE-2026-45447**, High: heap use-after-free in `PKCS7_verify()`), which both
+BoringSSL consumers here (unbound, nginx) therefore dodge entirely.
+
+The trap the recheck caught: **`/usr/sbin/unbound-anchor` and
+`/usr/sbin/unbound-host` had been libtool wrapper *scripts*, not binaries,
+since early May.** In a libtool build the top-directory "binaries" of tools
+that link `libunbound.la` are generated wrapper scripts (the real ELF lives in
+`./.libs/` and is only relinked by `make install`); an earlier manual install
+had copied the wrappers, which fail with `'/usr/sbin/.libs/unbound-anchor'
+does not exist`. The breakage was invisible because `ExecStartPre=-` tolerates
+the failure and in-daemon RFC5011 keeps the trust anchor fresh — but the
+recovery tool for a missed KSK rollover was dead, and every backup since May 5
+was a copy of the same broken wrapper. Both tools were restored from the
+March 26 distro backups (real ELF, system OpenSSL — fine for a bootstrap and a
+diagnostic tool), and both update scripts now refuse to copy the wrappers,
+with the trap documented inline.
+
+Residual note: the restored `unbound-anchor` links the *system* OpenSSL
+(3.0.16+quic1, a manually-installed package with **no repository update
+candidate**), which is version-affected by CVE-2026-45447. Practical exposure
+is minimal — it runs only at unbound start, fetches from data.iana.org over
+certificate-pinned HTTPS, and the PKCS#7 parse sits behind that — but the
++quic1 OpenSSL package should be rebased to 3.0.21 whenever it is next
+touched.
+
 ---
 
 ## 7. Performance Engineering — AGH Layer
