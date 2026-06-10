@@ -446,6 +446,27 @@ same zero-allocation / lock-free discipline applied to the rest of the stack.
   30 s → 10 s, explicit 5 s `PingTimeout`) so dead DoH keep-alive connections are
   reaped in ~15 s instead of riding the per-query timeout.
 
+**Security backports & dependency audit (2026-06-10)**
+
+- **Response-question validation** backported from upstream master (post-2.1.16,
+  credited to Kun-Ta Chu): responses whose question name/type/class don't match
+  the original query are rejected on the central response path, manual DNS
+  exchanges, and the DNSCrypt/DoH server probes; `_dnsExchange` also verifies
+  the response bit and ID. The channels are already authenticated (DNSCrypt
+  signatures / DoH TLS), so this guards against a misbehaving upstream resolver
+  — cheap defense-in-depth on the exact query path. The ODoH hunks of the
+  upstream patch were dropped (ODoH is removed in this fork).
+- **`golang.org/x/net` v0.54.0 → v0.55.0** — `govulncheck` flagged
+  [GO-2026-5026](https://pkg.go.dev/vuln/GO-2026-5026) (idna Punycode
+  acceptance) as *reachable* via the DoH transport
+  (`xtransport.go` → `http.Transport` → `idna.ToASCII`); low practical
+  exploitability (hostnames come from the static resolver config), fixed by the
+  bump. After it: **0 reachable vulnerabilities**. The re-vendor also dropped
+  the orphaned `go-hpke-compact` dependency left behind by the ODoH strip.
+- Verified **not** applicable, not backported: upstream's cloaking-rule cycle
+  fix (no cloaking rules) and the TCP-fallback fix for truncated *forwarded*
+  queries (no forwarding rules).
+
 **Measured** (AMD EPYC 7542, 4 vCPU, median of 3):
 
 | Change | Before | After |
