@@ -1541,6 +1541,33 @@ A journald rate-limit on the shield box (`LogRateLimitIntervalSec=10s` / `LogRat
 verified to cap 10 k → 500 lines and bring journald CPU 45% → 0%) was the prod stopgap; with the
 fork logging resets at Debug it becomes belt-and-suspenders rather than load-bearing.
 
+### 8.11 Fork Recheck — Upstream Parity + GO-2026-5026 Sweep (2026-06-10)
+
+A scheduled recheck of the dnsproxy fork against upstream and the Go vulnerability
+database. Upstream had exactly **one** commit since our v0.81.4 base (AGDNS-4074
+"limit reads", two hunks):
+
+- **Inbound DoH POST bound** (`serverhttps.go`) — upstream caught up to the fork:
+  our `00fc061` had already bounded it, with stricter semantics
+  (`dns.MaxMsgSize+1` so an oversized body fails `Unpack` instead of being
+  silently truncated to a parseable prefix). Nothing to take.
+- **Outbound DoH response bound** (`upstream/doh.go`) — the response body of the
+  DoH *upstream* transport was still an unbounded `io.ReadAll`; a misbehaving DoH
+  server could feed an arbitrarily large body. Backported in fork commit
+  `25d8f46` in the same stdlib style. Unreachable in the edge deployment (single
+  plain-UDP upstream to Unbound) — inert hardening for the compiled-in transport.
+
+**GO-2026-5026** (`x/net/idna` accepts ASCII-only Punycode labels it should
+reject) was flagged by `govulncheck` as *reachable* in the AGH binary on two
+paths: `dnsforward.NewServer → netutil.ValidateDomainName → idna.ToASCII`
+(startup) and — the one that matters — `querylog.questionPayload →
+idna.ToUnicode`, which runs on **attacker-controlled question names** when
+rendering query-log entries (display/spoofing class, not memory safety).
+`golang.org/x/net` bumped v0.53.0 → v0.55.0 in AGH (`10ffc8eb`) and the dnsproxy
+fork (`ad5e739`); the same sweep had already fixed the dnscrypt-proxy fork (§5).
+After the bumps, `govulncheck` reports **0 reachable vulnerabilities** across
+all three Go forks. Rebuilt + redeployed; DNS/DoT verified live.
+
 ---
 
 ## 9. Security Hardening
@@ -1556,6 +1583,8 @@ fork logging resets at Debug it becomes belt-and-suspenders rather than load-bea
 | **Transport timeout tightening (dnscrypt-proxy)** | 30 s default transport timeouts wired to the 800 ms query budget; h2 idle health-check decoupled (10 s read-idle / 5 s ping) | Resource — bounds connect/read and reaps dead keep-alive connections promptly |
 | **Whois TCP connections** | Replaced with local mmdb; no per-query outbound TCP | Privacy — eliminates external connection from query log enrichment |
 | **Data race fix** | Access manager field in middleware read without synchronization; fixed to atomic load | Correctness — undefined behaviour under Go memory model |
+| **x/net idna Punycode (GO-2026-5026)** | `golang.org/x/net` bumped to v0.55.0 across AGH, dnsproxy, and dnscrypt-proxy forks; reachable via query-log name rendering (`idna.ToUnicode` on attacker-controlled qnames) and the dnscrypt DoH transport. `govulncheck`: 0 reachable vulns after | Low/Medium — bad-Punycode acceptance (spoofing/display), not memory safety |
+| **DoH response body bound (dnsproxy)** | Upstream AGDNS-4074 backport: DoH *upstream* response read bounded at `dns.MaxMsgSize+1` (inbound POST side was already bounded by the fork first) | Low — unbounded read from a misbehaving DoH server; transport unreachable in this deployment |
 | **GLiNet path traversal (CVE-2026-41448)** | Backported the upstream v0.107.77 fix: GLiNet auth-token file reads confined to an `os.Root` (rejects `..`/absolute escapes), token filename reduced to a basename. Not exploitable in this deployment (runs without `--glinet`, so the GLiNet middleware is never installed); applied as defense-in-depth and to keep the fork mergeable | Medium — admin-auth bypass via a crafted `Admin-Token` cookie in GLiNet mode |
 
 ---
