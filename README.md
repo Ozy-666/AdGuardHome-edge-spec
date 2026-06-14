@@ -4,7 +4,6 @@
 [![Stack](https://img.shields.io/badge/Stack-Nginx%20%E2%86%92%20AGH%20%E2%86%92%20Unbound%20%E2%86%92%20dnscrypt--proxy-2b6cb0?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![Protocols](https://img.shields.io/badge/Protocols-DoH3%20%7C%20DoH%20%7C%20DoQ%20%7C%20DoT%20%7C%20DNS-2b6cb0?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![Binary Size](https://img.shields.io/badge/Binary%20Size-24.6%20MB%20(--10%20MB)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Bloat Removed](https://img.shields.io/badge/Codebase%20Bloat-13k%2B%20Lines%20Removed-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 
 ---
 
@@ -16,47 +15,44 @@
 
 Below is a detailed breakdown of the exact subsystem prunings and system-level performance enhancements implemented across our custom forks to maintain near-zero latency and high uptime.
 
-### 🗑️ Subsystem Stripping (Bloat Reduction)
-*These badges represent non-essential features of standard AdGuardHome that have been completely stripped out of our build to reduce resource consumption and eliminate security attack surface:*
+### 🔐 Cryptographic Substrate (BoringSSL)
+*The TLS termination and DNSSEC-validation hot paths run on a statically-linked BoringSSL substrate — formally-verified field arithmetic (fiat-crypto), zero provider-dispatch overhead:*
 
+[![nginx BoringSSL](https://img.shields.io/badge/nginx-BoringSSL%20TLS%201.3-2f855a?style=flat-square&logo=nginx&logoColor=white)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Unbound BoringSSL](https://img.shields.io/badge/Unbound-BoringSSL%20(ECDSA%20--26%25%20latency)-2f855a?style=flat-square&logo=letsencrypt&logoColor=white)](https://github.com/Ozy-666/AdGuardHome-edge-spec#66-cryptographic-substrate--unbound-on-boringssl)
+
+### 🗑️ Subsystem Stripping (Bloat Reduction)
+*Non-essential features of standard AdGuardHome, stripped to cut resource use and attack surface — ~13k LOC removed in total (largest items shown):*
+
+[![Blocked Services](https://img.shields.io/badge/Blocked%20Services-Removed%20(--5200%20LOC)-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![DHCP Subsystem](https://img.shields.io/badge/DHCP%20Subsystem-Stripped%20(--2400%20LOC)-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![SafeBrowsing & Parental](https://img.shields.io/badge/SafeBrowsing%20%26%20Parental-Removed%20(--2200%20LOC)-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Blocked Services](https://img.shields.io/badge/Blocked%20Services-Removed%20(--5200%20LOC)-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![SafeSearch Engine](https://img.shields.io/badge/SafeSearch%20Engine-Removed%20(--1419%20LOC)-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![DNSSEC Engine](https://img.shields.io/badge/DNSSEC%20Engine-Stripped%20%2F%20Offloaded-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![EDNS Subnet](https://img.shields.io/badge/EDNS%20Client%20Subnet-Stripped%20%2F%20Anti--Leak-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![UI Locales](https://img.shields.io/badge/UI%20Locales-English%20Only%20(--2%20MB)-4a5568?style=flat-square)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 
 ### ⚡ Engineering Patches & Optimizations
-*These badges represent active code-level corrections, memory allocation pools, and logic improvements across our transport, proxy, filter, and resolver / OS-tuning layers:*
+*Highlights across the transport, proxy, filter and resolver layers — full benchmarks in the sections below:*
 
-[![TCP DNS Framing](https://img.shields.io/badge/TCP%20DNS%20Framing-Hardened-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Goroutine Lifecycle](https://img.shields.io/badge/Goroutine%20Lifecycle-Leak--Free-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Config-Reload Stall](https://img.shields.io/badge/Config--Reload%20Stall-Removed-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 [![urlfilter Engine](https://img.shields.io/badge/urlfilter%20Fork-O(1)%20AST%20Regexp-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/urlfilter)
-[![UDP Query Buffers](https://img.shields.io/badge/UDP%20Query%20Buffers-0%20allocs%2Fop-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
-[![Encrypted Response](https://img.shields.io/badge/Encrypted%20Response-0%20allocs%2Fop-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
-[![Session Map](https://img.shields.io/badge/Session%20Map-Lazy--Init%20(0%20allocs)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnscrypt-proxy)
-[![Unbound Allocator](https://img.shields.io/badge/Unbound%20Allocator-jemalloc%20(LD__PRELOAD)-2b6cb0?style=flat-square&logo=linux)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Loopback RPS](https://img.shields.io/badge/Loopback%20RPS-Disabled%20(--14%25%20CPU)-2b6cb0?style=flat-square&logo=linux)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Client-Storage Lock](https://img.shields.io/badge/Per--Query%20Client%20Lock-Lock--Free%20(--79%25%20contention)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
-[![Real-Time WAF Feed](https://img.shields.io/badge/Real--Time%20WAF%20Feed-qfeed%20(0%20allocs%2C%20non--blocking)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Hot Paths](https://img.shields.io/badge/UDP%20%2F%20TCP%20Hot%20Paths-0%20allocs%2Fop-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnsproxy)
+[![Transport Hardening](https://img.shields.io/badge/Transport-Framing%20%2F%20Goroutines%20%2F%20Reload-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/dnsproxy)
+[![Client Lock](https://img.shields.io/badge/Per--Query%20Client%20Lock-Lock--Free%20(--79%25)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
+[![Real-Time WAF Feed](https://img.shields.io/badge/Real--Time%20WAF%20Feed-qfeed%20(0%20allocs)-2b6cb0?style=flat-square&logo=go)](https://github.com/Ozy-666/AdGuardHome-edge-spec)
 
 ---
 ## Production Deployment
 
 The architecture specified in this repository directly powers the backend
-infrastructure of **[dnsdoh.art](https://dnsdoh.art)** — a next-generation,
-ultra-fast, zero-telemetry public DNS resolver.
+infrastructure of **[dnsdoh.art](https://dnsdoh.art)** — a zero-telemetry,
+no-logs public DNS resolver.
 
-By running this highly optimised AdGuardHome Edge build tightly integrated with
+By running this optimised AdGuardHome Edge build tightly integrated with
 a custom [dnsproxy](https://github.com/Ozy-666/dnsproxy) transport layer and a
 custom [urlfilter](https://github.com/Ozy-666/urlfilter) filtering engine, the
 production deployment delivers:
 
 - **Strict Privacy:** Zero data retention, zero upstream client leakage
   (EDNS-CS stripped), and no cloud dependencies.
-- **Maximum Throughput:** Lock-free processing paths designed to withstand
+- **High Throughput:** Lock-free processing paths designed to withstand
   high-RPS conditions on AMD EPYC edge hardware.
 - **Hardened Filtering:** A custom `urlfilter` fork with AST-based shortcut
   extraction that keeps the rule-matching hot path O(1) even under
