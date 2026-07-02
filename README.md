@@ -1176,6 +1176,41 @@ of a speculative rewrite.
 
 ---
 
+### 7.16 DDR: Advertising Proxy-Terminated DoH (`ddr_external_doh`) (2026-07-02)
+
+**The gap.** Discovery of Designated Resolvers (RFC 9462) lets a client that only knows a
+resolver's bare IP upgrade to encryption by sending one SVCB query for `_dns.resolver.arpa`
+to that resolver. Upstream's handler (`makeDDRResponse`, `internal/dnsforward/process.go`)
+builds the answer purely from the listeners AGH terminates itself:
+
+- **DoH** — iterates `TLSConf.HTTPSListenAddrs`. In this deployment DoH TLS is terminated by
+  the fronting nginx on 443 and reaches AGH as plain HTTP over the Unix socket (`port_https: 0`),
+  so the list is empty and no DoH designation is ever emitted.
+- **DoT** — gated on the certificate containing an IP SAN (upstream #4927); the Let's Encrypt
+  certificate is name-only, so DoT is skipped.
+- **DoQ** — emitted unconditionally from `QUICListenAddr`.
+
+Net effect: DDR advertised **DoQ only**, and discovery-capable clients (Windows 11, Apple
+platforms) never learned that the standard DoH endpoint exists.
+
+**The fix.** A new opt-in bool `dns.ddr_external_doh` (default `false`). When set,
+`makeDDRResponse` appends one more designation targeting `tls.server_name`:
+
+```
+_dns.resolver.arpa. 300 IN SVCB 1 dnsdoh.art. alpn="h2,h3" port=443 dohpath="/dns-query{?dns}"
+```
+
+Standard RFC 8484 port and path template; ALPN matches what the fronting proxy actually serves
+(HTTP/2 and HTTP/3). The DoQ record is unchanged and both are served at priority 1.
+
+**Honest scope.** Strict *verified* DDR requires the designated server's certificate to cover the
+original resolver IP the client started from; without an IP SAN the designations (DoQ included)
+serve opportunistic upgrade only. That is a certificate question, not a code one — Let's Encrypt
+now issues short-lived IP-address certificates, so verified DDR is attainable later without
+touching this patch. DoT stays un-advertised for the same reason upstream gates it.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -1635,6 +1670,7 @@ top-level sections in `AdGuardHome.yaml`.
 | `cache_enabled` | `true` | bool | AGH front-cache (§7.13). Enabled to skip the localhost hop to unbound for the hot set (~57% of organic queries). `glcache` in-memory LRU. |
 | `cache_ttl_min` | `0` | seconds | Minimum TTL AGH pins on cached answers. Kept at **0** so real upstream TTLs are respected — never pin short-TTL CDN/GSLB answers. |
 | `cache_size` | `4194304` | bytes | RAM byte-budget for the front-cache (heap, counts toward `GOMEMLIMIT`). Raise (e.g. 32–64 MB) as traffic grows so the hot set keeps fitting. |
+| `ddr_external_doh` | `false` | bool | Adds a DoH designation (`alpn=h2,h3 port=443 dohpath=/dns-query{?dns}` at `tls.server_name`) to DDR responses when DoH TLS is terminated by the fronting proxy instead of AGH (§7.16). |
 
 ### `http` section
 
@@ -1677,6 +1713,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-07-02 | **feat:** DDR now advertises the proxy-terminated DoH endpoint — new opt-in `dns.ddr_external_doh` appends `alpn="h2,h3" port=443 dohpath="/dns-query{?dns}"` to `_dns.resolver.arpa` SVCB answers (upstream only advertises listeners AGH terminates itself, so the nginx-fronted DoH was invisible to discovery and only DoQ was designated) (§7.16) |
 | `v0.107.77-edge` | 2026-06-08 | **resilience:** client connection-reset write-errors logged at **Debug, not Error** (dnsproxy fork `b74b7bb`) — a DoT/DoQ flood of pipelined clients that hang up mid-response was emitting ~10 k ERROR lines/min, spiking systemd-journald to **~45% CPU during the attack**. `logWithNonCrit` already downgraded EOF/`ErrClosed`/EPIPE/timeout; `ECONNRESET` was the missing case. Added `isECONNRESET` to that Debug branch; genuine write errors stay at Error (§8.10) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** AGH front-cache **enabled** (`cache_enabled:true`, `cache_ttl_min:0`) — measured 57% organic hit rate; A/B replay of real querylog names **+60% throughput / −98% backend load**; DNSSEC-safe, respects real TTLs; hit-rate rises with traffic so it scales with growth (§7.13). Plus `filtering.BlockedResponseTTL` exclusive-lock→`RLock` fix (was 86% of mutex delay under cache-on load once the cache made the rest fast) (§7.12) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** plain-upstream **connection pooling** (dnsproxy fork `7363632`) — reuse UDP/TCP upstream connections instead of dial-and-close per query; eliminated the ~19% per-query `connect()` CPU the post-lock profile exposed. A/B: goodput **+40…+101%** across the c=100…600 ramp (≈doubled at c=400/600), c=600 canary 306→151 ms (§8.1). Also pinned `GOMEMLIMIT=380 MiB` below the cgroup `MemoryHigh=400 MiB` so Go GC precedes kernel reclaim (§10) |
