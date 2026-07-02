@@ -1205,9 +1205,23 @@ Standard RFC 8484 port and path template; ALPN matches what the fronting proxy a
 
 **Honest scope.** Strict *verified* DDR requires the designated server's certificate to cover the
 original resolver IP the client started from; without an IP SAN the designations (DoQ included)
-serve opportunistic upgrade only. That is a certificate question, not a code one — Let's Encrypt
-now issues short-lived IP-address certificates, so verified DDR is attainable later without
-touching this patch. DoT stays un-advertised for the same reason upstream gates it.
+serve opportunistic upgrade only. DoT stays un-advertised for the same reason upstream gates it.
+
+**Follow-up (same day): verified discovery via a dedicated designation target.** Let's Encrypt
+issues IP-SAN certificates (GA 2026-01) only under the *shortlived* profile — 160 h validity,
+renewal every ~4 days. Putting the whole production stack on that treadmill was rejected: a failed
+renewal would take down web, DoH, DoT and DoQ within days. Instead the blast radius is isolated:
+
+- A new optional string `dns.ddr_external_doh_target` overrides the DoH designation target
+  (default `tls.server_name`).
+- Deployment: a dedicated nginx vhost (`ddr.dnsdoh.art`) exposes **only** `/dns-query` (same
+  upstream, same rate limits) and serves a shortlived certificate carrying
+  `{DNS:ddr.dnsdoh.art, IP:194.180.189.33}` (certbot `--required-profile shortlived`,
+  `--reuse-key`, webroot http-01 — the IP identifier cannot be validated via dns-01).
+- The DDR answer becomes `1 ddr.dnsdoh.art. alpn="h2,h3" port=443 dohpath="/dns-query{?dns}"`
+  plus the stock DoQ record. Strict clients (Windows 11, Apple) can now complete verified
+  discovery against the IP SAN; if the shortlived lineage ever fails to renew, only discovery
+  verification degrades — the main certificate and every existing endpoint are untouched.
 
 ---
 
@@ -1671,6 +1685,7 @@ top-level sections in `AdGuardHome.yaml`.
 | `cache_ttl_min` | `0` | seconds | Minimum TTL AGH pins on cached answers. Kept at **0** so real upstream TTLs are respected — never pin short-TTL CDN/GSLB answers. |
 | `cache_size` | `4194304` | bytes | RAM byte-budget for the front-cache (heap, counts toward `GOMEMLIMIT`). Raise (e.g. 32–64 MB) as traffic grows so the hot set keeps fitting. |
 | `ddr_external_doh` | `false` | bool | Adds a DoH designation (`alpn=h2,h3 port=443 dohpath=/dns-query{?dns}` at `tls.server_name`) to DDR responses when DoH TLS is terminated by the fronting proxy instead of AGH (§7.16). |
+| `ddr_external_doh_target` | (empty) | hostname | Overrides the `ddr_external_doh` designation target. Point at a vhost whose cert contains the target name AND the resolver IP for verified DDR, RFC 9462 §4.2 (§7.16). |
 
 ### `http` section
 
@@ -1713,6 +1728,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-07-02 | **feat:** `dns.ddr_external_doh_target` — DDR DoH designation can target a dedicated vhost whose shortlived LE cert carries the resolver IP SAN, enabling strict verified discovery (RFC 9462 §4.2) with the blast radius confined to the discovery lineage (§7.16) |
 | `v0.107.77-edge` | 2026-07-02 | **feat:** DDR now advertises the proxy-terminated DoH endpoint — new opt-in `dns.ddr_external_doh` appends `alpn="h2,h3" port=443 dohpath="/dns-query{?dns}"` to `_dns.resolver.arpa` SVCB answers (upstream only advertises listeners AGH terminates itself, so the nginx-fronted DoH was invisible to discovery and only DoQ was designated) (§7.16) |
 | `v0.107.77-edge` | 2026-06-08 | **resilience:** client connection-reset write-errors logged at **Debug, not Error** (dnsproxy fork `b74b7bb`) — a DoT/DoQ flood of pipelined clients that hang up mid-response was emitting ~10 k ERROR lines/min, spiking systemd-journald to **~45% CPU during the attack**. `logWithNonCrit` already downgraded EOF/`ErrClosed`/EPIPE/timeout; `ECONNRESET` was the missing case. Added `isECONNRESET` to that Debug branch; genuine write errors stay at Error (§8.10) |
 | `v0.107.77-edge` | 2026-06-04 | **perf:** AGH front-cache **enabled** (`cache_enabled:true`, `cache_ttl_min:0`) — measured 57% organic hit rate; A/B replay of real querylog names **+60% throughput / −98% backend load**; DNSSEC-safe, respects real TTLs; hit-rate rises with traffic so it scales with growth (§7.13). Plus `filtering.BlockedResponseTTL` exclusive-lock→`RLock` fix (was 86% of mutex delay under cache-on load once the cache made the rest fast) (§7.12) |
