@@ -1225,6 +1225,33 @@ renewal would take down web, DoH, DoT and DoQ within days. Instead the blast rad
 
 ---
 
+### 7.17 DDR: `ipv4hint` in Every Designation (2026-07-10)
+
+**The gap.** A DDR answer names the designated resolver (`dnsdoh.art`) but, without address
+hints, a bootstrapping client must resolve that name's A record before it can open the
+encrypted session - one extra round trip through the very plain-DNS path DDR is trying to
+leave, at the one moment latency is most visible. Cloudflare's production DDR records ship
+`ipv4hint`/`ipv6hint` on every designation for exactly this reason.
+
+**The fix.** A new optional `dns.ddr_ipv4_hint` (`netip.Addr`). When set to a valid IPv4
+address, `makeDDRResponse` appends `ipv4hint=<addr>` to **every** designation - the
+external-DoH record, DoT and DoQ:
+
+```
+_dns.resolver.arpa. 300 IN SVCB 1 dnsdoh.art. alpn="h2,h3" port=443 ipv4hint=194.180.189.33 key7="/dns-query{?dns}"
+_dns.resolver.arpa. 300 IN SVCB 1 dnsdoh.art. alpn="dot" port=853 ipv4hint=194.180.189.33
+_dns.resolver.arpa. 300 IN SVCB 1 dnsdoh.art. alpn="doq" port=853 ipv4hint=194.180.189.33
+```
+
+SVCB parameters must be wire-encoded in ascending key order (RFC 9460 §2.2), so the hint
+(key 4) is inserted between `port` (3) and `dohpath` (7) rather than appended. Hints are
+non-authoritative (RFC 9460 §7.3): clients still resolve the target name and prefer those
+answers, so a future re-addressing propagates normally. Unset keeps prior behavior exactly;
+the deployment sets it to the resolver's own anycast-facing address (IPv4-only service, so
+no `ipv6hint` counterpart).
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -1690,6 +1717,7 @@ top-level sections in `AdGuardHome.yaml`.
 | `cache_size` | `4194304` | bytes | RAM byte-budget for the front-cache (heap, counts toward `GOMEMLIMIT`). Raise (e.g. 32–64 MB) as traffic grows so the hot set keeps fitting. |
 | `ddr_external_doh` | `false` | bool | Adds a DoH designation (`alpn=h2,h3 port=443 dohpath=/dns-query{?dns}` at `tls.server_name`) to DDR responses when DoH TLS is terminated by the fronting proxy instead of AGH (§7.16). |
 | `ddr_external_doh_target` | (empty) | hostname | Overrides the `ddr_external_doh` designation target. Point at a vhost whose cert contains the target name AND the resolver IP for verified DDR, RFC 9462 §4.2 (§7.16). |
+| `ddr_ipv4_hint` | (unset) | IPv4 address | Adds `ipv4hint=<addr>` to every DDR designation (DoH, DoT, DoQ) so clients skip the A lookup for the target name during bootstrap (§7.17). |
 
 ### `http` section
 
@@ -1732,6 +1760,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-07-10 | **feat:** `dns.ddr_ipv4_hint` — every DDR designation (DoH, DoT, DoQ) now carries `ipv4hint=<resolver IP>`, matching Cloudflare's record shape; bootstrapping clients open the encrypted handshake without a separate A lookup for the target name (one RTT saved). Inserted before `dohpath` to keep SVCB params in ascending wire order (RFC 9460 §2.2) (§7.17) |
 | `v0.107.77-edge` | 2026-07-07 | **security:** upstream cherry-pick sweep — dnsproxy AGDNS-4080 (DoH upstream ID-zeroing in wire bytes, ID-0 echo required, question-section validation unified with plain DNS; fork's pooled connection evicted on invalid response) + AGH #8276 (`ech=` rewrite values parse as unpadded base64). Same-day follow-ups: AGH AGDNS-4081 (rulelist downloads bounded by new `filtering.max_http_size`, default 256 MB) + AGDNS-4111/4038 (h2c upgrade path removed, stdlib prior-knowledge HTTP/2; AG-54599 assessed N/A - blocked services stripped). Deferred by decision: dnsproxy v0.83.0 rebase (FORMERR responses land on the fork's UDP-pool code) (§9) |
 | `v0.107.77-edge` | 2026-07-02 | **feat:** `dns.ddr_external_doh_target` — DDR DoH designation can target a dedicated vhost whose shortlived LE cert carries the resolver IP SAN, enabling strict verified discovery (RFC 9462 §4.2) with the blast radius confined to the discovery lineage (§7.16) |
 | `v0.107.77-edge` | 2026-07-02 | **feat:** DDR now advertises the proxy-terminated DoH endpoint — new opt-in `dns.ddr_external_doh` appends `alpn="h2,h3" port=443 dohpath="/dns-query{?dns}"` to `_dns.resolver.arpa` SVCB answers (upstream only advertises listeners AGH terminates itself, so the nginx-fronted DoH was invisible to discovery and only DoQ was designated) (§7.16) |
