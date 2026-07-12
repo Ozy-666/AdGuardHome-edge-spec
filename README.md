@@ -1291,9 +1291,9 @@ gate can shadow the other. A slip fires if **either** is exhausted.
   the `TC=1` signal and immediately retries over **TCP/53** (RFC 7766), where it gets the
   full answer. Zero service disruption.
 - **A spoofed source** cannot complete a TCP three-way handshake, so the attack simply
-  cannot follow the truncation to TCP. The 32-byte header is *smaller than the 71-byte
-  query*: amplification collapses from 31.8× to **~0.7×**, i.e. the resolver stops being
-  an amplifier entirely.
+  cannot follow the truncation to TCP. The 32-byte response is *smaller than the 71-byte
+  query*: amplification collapses from 31.8× to **~0.45×** (32 / 71), i.e. the resolver
+  stops being an amplifier entirely and emits fewer bytes than it receives.
 
 Only plain UDP is gated. **DoT, DoQ, DoH, and TCP are connection-verified and inherently
 immune to source spoofing**, so they bypass the engine untouched.
@@ -1310,15 +1310,18 @@ had already validated as safe. Enforcement was then flipped on and verified on t
 
 **Observed result (live flood, 2026-07-12).**
 
-| Metric | Before (shadow) | After (enforce) | Effect |
+| Metric | Before (no RRL) | After (enforce) | Effect |
 |---|---|---|---|
-| Per-query amplification | 31.8× (71 B → 2,257 B) | **~0.7×** (71 B → 32 B `TC=1`) | net de-amplifier |
+| Response to a spoofed query | 2,257 B (2 fragments) | **32 B** (`TC=1`) | — |
+| Per-query amplification | **31.8×** (2,257 / 71) | **~0.45×** (32 / 71) | net de-amplifier |
 | Large outbound response fragments | ~132 /s | **~4.5 /s** (= the 5 q/s legit budget) | **96.6%** fewer |
 | Amplified egress for the target record | ~2.4 Mbps | **~0.08 Mbps** | ~96% suppressed |
 | Flood-name query under enforce (20 samples) | full 2.2 KB answer | **20/20 `TC=1`** | truncated |
 | Non-flood large record (control, `DNSKEY`) | served | **served, 0 slipped** | FP-safe |
 | Legitimate resolution | served (shared-bucket risk) | **untouched** | 100% FP-safe |
 | False-positive ledger | — | **CLEAN over 67,905 shadow decisions** | validated |
+| Per-query CPU cost | — | **0.061 ms** median (n=125k) | sub-100 µs |
+| Cumulative responses neutralized | — | **2.8 M+** and climbing | — |
 
 The residual ~4.5 outbound fragments per second is not leakage — it is exactly the
 5 q/s the token buckets legitimately allow through, so a real client that happens to ask
@@ -1764,7 +1767,7 @@ all three Go forks. Rebuilt + redeployed; DNS/DoT verified live.
 
 | Area | Change | Severity |
 |---|---|---|
-| **DNS reflection/amplification** | Size-gated Response Rate Limiting with `TC=1` slip (§7.18): over-budget large UDP responses to a hot `(qname, qtype)` truncated to a 32-byte header, collapsing a 31.8× amplifier to ~0.7×. Live-validated at 96.6% egress reduction, FP-clean over 67,905 decisions. UDP-only; DoT/DoQ/DoH/TCP exempt | High — resolver used as a reflection weapon against third parties |
+| **DNS reflection/amplification** | Size-gated Response Rate Limiting with `TC=1` slip (§7.18): over-budget large UDP responses to a hot `(qname, qtype)` truncated to a 32-byte header, collapsing a 31.8× amplifier to ~0.45×. Live-validated at 96.6% egress reduction, FP-clean over 67,905 decisions. UDP-only; DoT/DoQ/DoH/TCP exempt | High — resolver used as a reflection weapon against third parties |
 | **DoH POST flood** | Body capped at DNS wire-format maximum (65,535 bytes); `413` returned before any DNS unpacking | Medium — memory exhaustion under targeted POST flood |
 | **QUIC stream flood** | Per-connection stream limit configurable, default 64 (was 65,535); enforced by QUIC transport `MAX_STREAMS` frame | High — single client could drain global request semaphore, starving all others |
 | **Cloud telemetry** | SafeBrowsing, Parental Controls, EDNS-CS all removed; no DNS query data leaves the local machine | Privacy — eliminates data leakage to third-party cloud services |
