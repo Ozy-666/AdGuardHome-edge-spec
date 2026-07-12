@@ -1252,6 +1252,89 @@ no `ipv6hint` counterpart).
 
 ---
 
+### 7.18 Size-Gated DNS Response Rate Limiting with TC=1 Slip (2026-07-12)
+
+An open resolver that answers a large record over UDP is a **reflection/amplification
+weapon**: an attacker spoofs a victim's source address, sends a tiny query for a fat
+cached record, and the resolver mails the amplified answer to the victim. The edge
+deployment was observed doing exactly this during intermittent, hours-long floods that
+recur periodically — a spoofed swarm querying `cloudflare.com`/`TXT` (a 2,257-byte
+SPF + domain-verification record) at **~130–250 q/s** from thousands of carpet-bombed
+source addresses. A **71-byte query yields a 2,257-byte response: a 31.8× amplification
+factor**, fragmented on the wire.
+
+The two source-address rate limiters already present at L4 (per-IP and per-/24) never
+fired: the attack is deliberately sub-threshold per source (1–5 queries per spoofed
+address across thousands of them). Amplification is a property of the **response**, not
+the address — so the defense has to live where the response is built, and key on what the
+attacker *cannot* cheaply vary: the query name.
+
+**The engine (`internal/rrl`).** A new pipeline stage runs after the answer is resolved
+(cache or upstream) and before it is written, so an over-budget response can be truncated
+in place. Every outgoing **UDP** response passes three gates:
+
+| Gate | Key | Role |
+|---|---|---|
+| **1 — Size pass** | `len(response) ≤ 512 B` | *FP-safety.* Below the gate the response can never be a slip candidate, at any rate. This exempts essentially all normal browsing (A/AAAA/HTTPS answers) — measured at **99.7%** of live traffic — making it structurally untouchable. |
+| **2 — Subnet bucket** | `(src /24, qname, qtype)` | *Fairness.* Stops one noisy network from draining the global allowance for a hot record. |
+| **3 — Global bucket** | `(qname, qtype)` | *Amplification killer.* A carpet-bombing flood spread over thousands of /24s converges on **one** global bucket. This is the gate that actually collapses the attack — spoofing more sources is free, finding another 32× record is not. |
+
+Both buckets are token buckets (default **5 tokens/s, burst 20**) and are **charged on
+every call** — the engine never short-circuits on the first exhausted bucket, so neither
+gate can shadow the other. A slip fires if **either** is exhausted.
+
+**The slip (TC=1).** An over-budget response is not dropped — it is replaced with a
+**32-byte** header carrying the Truncated (`TC=1`) bit and an empty answer section
+(RFC 1035 §4.1.1). The consequences split cleanly by whether the source is real:
+
+- **A legitimate client** — even one NAT'd behind the same /24 as the attack — receives
+  the `TC=1` signal and immediately retries over **TCP/53** (RFC 7766), where it gets the
+  full answer. Zero service disruption.
+- **A spoofed source** cannot complete a TCP three-way handshake, so the attack simply
+  cannot follow the truncation to TCP. The 32-byte header is *smaller than the 71-byte
+  query*: amplification collapses from 31.8× to **~0.7×**, i.e. the resolver stops being
+  an amplifier entirely.
+
+Only plain UDP is gated. **DoT, DoQ, DoH, and TCP are connection-verified and inherently
+immune to source spoofing**, so they bypass the engine untouched.
+
+**Co-design and validation (shadow → parity → flip).** RRL is the enforcement half of a
+split defense: the L7 WAF (§7.10, the `qfeed` co-design) runs the *same* size-gated
+dual-bucket logic in **shadow** over its query feed — deciding, counting, changing
+nothing — while this stage enforces inside the resolver. Because both sides share the
+frozen qname-hash rule (the XXH3-64 normalization of §7.10) and an identical engine, their
+decisions agree by construction. Before enforcement was enabled, the two were compared on
+the *same* live flood over a 30-second window and read identically — **98.0% slip, 5.0
+answered/second** on both — confirming the resolver would truncate exactly the set the WAF
+had already validated as safe. Enforcement was then flipped on and verified on the wire.
+
+**Observed result (live flood, 2026-07-12).**
+
+| Metric | Before (shadow) | After (enforce) | Effect |
+|---|---|---|---|
+| Per-query amplification | 31.8× (71 B → 2,257 B) | **~0.7×** (71 B → 32 B `TC=1`) | net de-amplifier |
+| Large outbound response fragments | ~132 /s | **~4.5 /s** (= the 5 q/s legit budget) | **96.6%** fewer |
+| Amplified egress for the target record | ~2.4 Mbps | **~0.08 Mbps** | ~96% suppressed |
+| Flood-name query under enforce (20 samples) | full 2.2 KB answer | **20/20 `TC=1`** | truncated |
+| Non-flood large record (control, `DNSKEY`) | served | **served, 0 slipped** | FP-safe |
+| Legitimate resolution | served (shared-bucket risk) | **untouched** | 100% FP-safe |
+| False-positive ledger | — | **CLEAN over 67,905 shadow decisions** | validated |
+
+The residual ~4.5 outbound fragments per second is not leakage — it is exactly the
+5 q/s the token buckets legitimately allow through, so a real client that happens to ask
+for the same record during a flood is still served.
+
+**Configuration.** Environment-gated, default off; enabled and flipped from shadow to
+enforce without a rebuild. Defaults: rate 5 tokens/s, burst 20, size gate 512 B, UDP-only.
+**Standards:** the mechanism is the classic Vixie/Schryver RRL-with-SLIP technique
+expressed in the resolver; it honors EDNS buffer limits (RFC 6891) and relies on the
+mandatory truncation-retry-over-TCP contract (RFC 1035 §4.1.1, RFC 7766). It is *not* a
+blind L4 rate limiter: normal small queries and every connection-oriented transport are
+exempt by construction, and only weaponized fat records over spoofable UDP are ever
+touched.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -1681,6 +1764,7 @@ all three Go forks. Rebuilt + redeployed; DNS/DoT verified live.
 
 | Area | Change | Severity |
 |---|---|---|
+| **DNS reflection/amplification** | Size-gated Response Rate Limiting with `TC=1` slip (§7.18): over-budget large UDP responses to a hot `(qname, qtype)` truncated to a 32-byte header, collapsing a 31.8× amplifier to ~0.7×. Live-validated at 96.6% egress reduction, FP-clean over 67,905 decisions. UDP-only; DoT/DoQ/DoH/TCP exempt | High — resolver used as a reflection weapon against third parties |
 | **DoH POST flood** | Body capped at DNS wire-format maximum (65,535 bytes); `413` returned before any DNS unpacking | Medium — memory exhaustion under targeted POST flood |
 | **QUIC stream flood** | Per-connection stream limit configurable, default 64 (was 65,535); enforced by QUIC transport `MAX_STREAMS` frame | High — single client could drain global request semaphore, starving all others |
 | **Cloud telemetry** | SafeBrowsing, Parental Controls, EDNS-CS all removed; no DNS query data leaves the local machine | Privacy — eliminates data leakage to third-party cloud services |
