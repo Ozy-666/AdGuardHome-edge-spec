@@ -1338,6 +1338,71 @@ touched.
 
 ---
 
+### 7.19 DDR: Ranked Designations Instead of a Three-Way Tie (2026-07-30)
+
+**The gap.** Upstream emits every DDR designation with `SvcPriority` 1, mirroring the
+examples in the draft that became RFC 9462, and carries an in-tree
+`TODO: Consider setting the priority values based on the protocol`. Equal priorities are a
+tie, and RFC 9460 §2.4.1 has clients break ties **at random**. A client supporting all
+three transports could therefore land on any of them, including the slowest one we offer,
+on every fresh discovery.
+
+**The fix.** Three named constants rank the designations, and the DoQ record is emitted
+before DoT so a `dig`/`kdig` capture reads in rank order (answer order carries no meaning
+on the wire):
+
+```
+_dns.resolver.arpa. 300 IN SVCB 1 dnsdoh.art. alpn="h3,h2" port=443 ipv4hint=... key7="/dns-query{?dns}"
+_dns.resolver.arpa. 300 IN SVCB 2 dnsdoh.art. alpn="doq"   port=853 ipv4hint=...
+_dns.resolver.arpa. 300 IN SVCB 3 dnsdoh.art. alpn="dot"   port=853 ipv4hint=...
+```
+
+**The ranking is by reachability, not by speed, and that is deliberate.** Our own
+transport benchmarks make DoQ the fastest to a first answer - a full round trip ahead of
+DoH3 on a cold connection, with a bounded tail under packet loss - so a speed ranking would
+put it first. It lives on port 853, which restrictive networks block outright, and a
+blocked port costs the client a timeout before it falls back to the next record. DDR exists
+to upgrade clients on networks nobody controls, so *reachable* beats *fast*. Port 443
+carries `h3` and `h2` in a single designation, so a client that cannot complete an HTTP/3
+handshake falls back to TCP without leaving the record at all. Ranking DoH first costs a
+DoQ-capable client nothing where 443 works, because a client only considers designations
+whose ALPN it supports.
+
+The `alpn` list is a **set**, not a preference order: RFC 9460 §7.1.1 has the client choose
+from the intersection by its own preference. Writing `h3,h2` rather than `h2,h3` is
+presentation only and steers no client.
+
+Verified live over UDP/53, TCP/53 and all three encrypted transports; the designation is
+identical on every path.
+
+---
+
+### 7.20 DoT ALPN Confirms What DDR Advertises (2026-07-30)
+
+**The gap.** The DDR designation above advertises `alpn="dot"` for the port-853 TCP
+endpoint, but the DoT listener negotiated **no ALPN at all**. Upstream `dnsproxy` hands the
+shared `TLSConfig` to `tls.NewListener` unchanged in `initTLSListeners`, while the HTTPS
+and QUIC listeners clone that config and set their own `NextProtos`. The resolver was
+promising a token it never confirmed:
+
+```
+$ openssl s_client -connect <resolver>:853 -alpn dot </dev/null | grep ALPN
+No ALPN negotiated
+```
+
+**The fix** lives in the dnsproxy fork (`14c4d5b`): clone the config and offer the RFC 7858
+§6 token. After deployment the same command returns `ALPN protocol: dot`, confirmed against
+three independent client stacks.
+
+ALPN remains **optional** for DoT - RFC 7858 §3.1 forbids rejecting a connection that does
+not use it, and a client sending no ALPN extension still connects, which was verified
+explicitly rather than assumed. The one behavior change is RFC 7301 conformance: a client
+that offers an ALPN list with no token in common is now refused instead of silently
+accepted. No DoT client does this; it is recorded here because it is the only regression
+surface.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -1847,6 +1912,8 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.77-edge` | 2026-07-30 | **feat:** DDR designations now **ranked** `1` DoH (443, `h3,h2`) / `2` DoQ / `3` DoT instead of sharing priority 1 (upstream's own `TODO`). Equal priorities are a tie that RFC 9460 §2.4.1 has clients break at random, so a client supporting all three could land on the slowest transport on every discovery. Ranked by **reachability, not speed**: DoQ measures fastest but sits on port 853, which restrictive networks block, and a blocked port costs a timeout before fallback; 443 carries `h3`+`h2` in one designation so an HTTP/3 failure falls back to TCP without leaving the record (§7.19) |
+| `v0.107.77-edge` | 2026-07-30 | **fix:** DoT listeners now offer the RFC 7858 §6 `dot` ALPN (dnsproxy fork `14c4d5b`) — the DDR designation advertised `alpn="dot"` while the port-853 handshake negotiated no ALPN at all, because upstream passes the shared `TLSConfig` to `tls.NewListener` unchanged. ALPN stays optional per RFC 7858 §3.1 (a client sending none still connects, verified); the only behavior change is RFC 7301 conformance for a client offering no common token (§7.20) |
 | `v0.107.77-edge` | 2026-07-10 | **feat:** `dns.ddr_ipv4_hint` — every DDR designation (DoH, DoT, DoQ) now carries `ipv4hint=<resolver IP>`, matching Cloudflare's record shape; bootstrapping clients open the encrypted handshake without a separate A lookup for the target name (one RTT saved). Inserted before `dohpath` to keep SVCB params in ascending wire order (RFC 9460 §2.2) (§7.17) |
 | `v0.107.77-edge` | 2026-07-07 | **security:** upstream cherry-pick sweep — dnsproxy AGDNS-4080 (DoH upstream ID-zeroing in wire bytes, ID-0 echo required, question-section validation unified with plain DNS; fork's pooled connection evicted on invalid response) + AGH #8276 (`ech=` rewrite values parse as unpadded base64). Same-day follow-ups: AGH AGDNS-4081 (rulelist downloads bounded by new `filtering.max_http_size`, default 256 MB) + AGDNS-4111/4038 (h2c upgrade path removed, stdlib prior-knowledge HTTP/2; AG-54599 assessed N/A - blocked services stripped). Deferred by decision: dnsproxy v0.83.0 rebase (FORMERR responses land on the fork's UDP-pool code) (§9) |
 | `v0.107.77-edge` | 2026-07-02 | **feat:** `dns.ddr_external_doh_target` — DDR DoH designation can target a dedicated vhost whose shortlived LE cert carries the resolver IP SAN, enabling strict verified discovery (RFC 9462 §4.2) with the blast radius confined to the discovery lineage (§7.16) |
