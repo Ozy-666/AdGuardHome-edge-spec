@@ -1403,6 +1403,76 @@ surface.
 
 ---
 
+### 7.21 Upstream v0.107.78: Reviewed, Not Merged (2026-07-31)
+
+This fork tracks upstream by **review**, not by merge. It strips DHCP, ECS, large parts of
+the dashboard and the CI pipeline, so a `git merge` of an upstream release spends most of
+its effort re-adding code that was deliberately removed: a trial merge of v0.107.78
+produced 67 conflicted files, 34 of them "deleted by us, modified by them". The version
+string is a **review marker** — it records which upstream release was read, not which
+commit the tree descends from.
+
+**The structural finding: nothing in v0.107.78 needed a change in AdGuard Home itself.**
+Every item under the release's *Security* heading resolves to a `dnsproxy` fix that reaches
+AGH through the `go.mod` bump. On any future release, read `dnsproxy` first.
+
+**Ported into the dnsproxy fork** (`edge-udp-pool`):
+
+| upstream | fork | change |
+|---|---|---|
+| `a221504` | `35baa86` | The AA bit is cleared on upstream responses (AGH #7955). A forwarding resolver is not authoritative for what it relays; clean cherry-pick. |
+| `0d3732b` | `c9d9863` | A UDP packet whose header parses but whose body does not is answered **FORMERR** instead of dropped, and a request whose question count is not 1 returns FORMERR rather than SERVFAIL (RFC 1035 §4.1.1). This is the GHSA-p5f5-3p5g-rfjw (JIGGLE) mitigation. Hand-merged against the fork's `respondUDP`, which carries the pooled pack buffer and a different signature. |
+| `9f66818` | `df16938` | DoQ now refuses unidirectional QUIC streams outright (`MaxIncomingUniStreams: -1`); DoH3 moves to its own `newServerDoH3Config`, keeping the 64 it needs for the HTTP/3 control stream and the QPACK encoder/decoder streams (≥3 per RFC 9114). |
+
+Two details worth recording because they are easy to get wrong. The upstream commit *named*
+for JIGGLE, `f35ca3e`, contains only the regression test and a Go bump; the mitigation is
+`0d3732b`. And `5235b4c` "set alpn set dot" touches `upstream/dot.go`, the **outgoing** DoT
+client — it does not overlap §7.20, which offers the ALPN on the DoT **listener**.
+
+On the QUIC advisory (GHSA-qr92-rwvw-mhgh, GHSA-cccx-2r6r-m9r4) this fork was already ahead:
+`f9ab1de` had bounded `MaxIncomingUniStreams` at 64 against upstream's vulnerable
+`math.MaxUint16`, so the memory-exhaustion vector was capped before the advisory. Upstream's
+own fix drops the configurable *bidirectional* limit; the knob is kept here (§10).
+
+**Already present, so not re-taken:** GHSA-4qjf-2hgm-92q6 DoH upstream validation
+(`2c1f097` + `25d8f46`), AGH #8276 `ech=` parsing (`161b0817`), the h2c upgrade path removal
+(`d9e8847d`), the rulelist size cap (`3aac5695`), CVE-2026-41448 (`3336007e`), and Go 1.26.5
+as the build toolchain.
+
+**Deliberately skipped.** The stricter DNSCrypt *upstream* validation and the surrounding
+DNSCrypt refactors do not apply: `upstream_dns` is `127.0.0.1:5353`, plain DNS to a local
+dnscrypt-proxy process (§5), so AdGuard Home never speaks the DNSCrypt protocol itself. The
+new `max_http_size` option is skipped because the cap here is hardcoded, which is stricter.
+Everything else in the release — DHCP, updater logging, translations, the dashboard, the
+filter-update interval range — sits in code this fork either removed or does not reach.
+
+**On answering malformed packets.** The JIGGLE mitigation converts a silent drop into a
+reply, which deserved scrutiny after the reflection incident in §7.18. Two findings. First,
+the reply bypasses the RRL: rate limiting lives in AGH's request handler, while FORMERR is
+emitted earlier, inside dnsproxy. Second, it cannot amplify. Measured against the deployed
+build, a 33-byte malformed query drew a **12-byte** response — **0.36×**, a deamplifier,
+because a question that fails to parse is not echoed back:
+
+```
+reply 12 B  (request was 33 B)   rcode=1 (FORMERR)  qr=1 aa=0
+qd=0 an=0 ns=0 ar=0
+```
+
+The packet filter covers the RRL gap independently: UDP/53 is metered at 30 packets per
+second per source address and 150 per `/24`, both with 30-minute bans, and packets shorter
+than 28 bytes or carrying the QR bit or a nonzero opcode never reach the daemon.
+
+**Verified after deployment:** `v0.107.78-edge`; no `aa` flag in answers; DoT ALPN `dot`;
+DoQ answering (the `-1` unidirectional setting does not affect DoQ clients, which open none);
+DDR still ranked 1/2/3 with `ipv4hint`; DNS cookies validating; no errors in the journal.
+
+Two test failures in the AGH tree are **pre-existing and unrelated**, confirmed by re-running
+the untouched baseline: `internal/configmigrate` expects `session_ttl: 720h` where golibs now
+renders `30d`, and `internal/next/dnssvc` expects one listen address where the SO_REUSEPORT
+sharding (§8) creates one per core.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -1912,6 +1982,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.78-edge` | 2026-07-31 | **security:** upstream v0.107.78 reviewed and three `dnsproxy` patches taken — AA bit cleared on relayed responses (AGH #7955), FORMERR instead of a silent drop for malformed UDP (GHSA-p5f5-3p5g-rfjw, the JIGGLE mitigation), and unidirectional QUIC streams refused on DoQ with DoH3 split into its own config (GHSA-qr92-rwvw-mhgh / GHSA-cccx-2r6r-m9r4, where this fork was already ahead at 64 vs upstream's `math.MaxUint16`). Nothing was needed in AdGuard Home itself; the DNSCrypt-upstream fixes and `max_http_size` were skipped as not applicable. The FORMERR reply was measured at **0.36×** the triggering packet, a deamplifier. Closes the "deferred by decision" dnsproxy v0.83.0 item below (§7.21) |
 | `v0.107.77-edge` | 2026-07-30 | **feat:** DDR designations now **ranked** `1` DoH (443, `h3,h2`) / `2` DoQ / `3` DoT instead of sharing priority 1 (upstream's own `TODO`). Equal priorities are a tie that RFC 9460 §2.4.1 has clients break at random, so a client supporting all three could land on the slowest transport on every discovery. Ranked by **reachability, not speed**: DoQ measures fastest but sits on port 853, which restrictive networks block, and a blocked port costs a timeout before fallback; 443 carries `h3`+`h2` in one designation so an HTTP/3 failure falls back to TCP without leaving the record (§7.19) |
 | `v0.107.77-edge` | 2026-07-30 | **fix:** DoT listeners now offer the RFC 7858 §6 `dot` ALPN (dnsproxy fork `14c4d5b`) — the DDR designation advertised `alpn="dot"` while the port-853 handshake negotiated no ALPN at all, because upstream passes the shared `TLSConfig` to `tls.NewListener` unchanged. ALPN stays optional per RFC 7858 §3.1 (a client sending none still connects, verified); the only behavior change is RFC 7301 conformance for a client offering no common token (§7.20) |
 | `v0.107.77-edge` | 2026-07-10 | **feat:** `dns.ddr_ipv4_hint` — every DDR designation (DoH, DoT, DoQ) now carries `ipv4hint=<resolver IP>`, matching Cloudflare's record shape; bootstrapping clients open the encrypted handshake without a separate A lookup for the target name (one RTT saved). Inserted before `dohpath` to keep SVCB params in ascending wire order (RFC 9460 §2.2) (§7.17) |
