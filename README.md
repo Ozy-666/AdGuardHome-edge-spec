@@ -1471,6 +1471,107 @@ the untouched baseline: `internal/configmigrate` expects `session_ttl: 720h` whe
 renders `30d`, and `internal/next/dnssvc` expects one listen address where the SO_REUSEPORT
 sharding (§8) creates one per core.
 
+### 7.22 Upstream v0.107.79: Reviewed, One Fix Adapted (2026-08-21)
+
+Upstream released v0.107.79 on 2026-08-18 under a *Security* heading. Read as a review
+rather than a merge (§7.21), it resolves into three parts, and **only one of them was code
+this fork could take unchanged — and even that one could not be taken unchanged.**
+
+**The two security items needed nothing from upstream's tree.** GHSA-w6v6-f44j-3rj2, "DoQ
+unidirectional stream state exhaustion", is a `dnsproxy` advisory, patched upstream in
+dnsproxy v0.83.1: a client opens the highest-numbered unidirectional stream, QUIC stream-ID
+semantics implicitly open all 65,535 below it, and dnsproxy never reads or cancels them, so
+receive-stream state is pinned until the connection closes. This fork answered it three
+weeks earlier in `df16938` (§7.21) by refusing unidirectional streams outright on DoQ. The
+second item is the Go toolchain: the deployed binary was built with Go **1.26.5**, and Go
+1.26.6 (2026-08-13) carries security fixes to the `go` command and to `crypto/tls`,
+`encoding/asn1`, `encoding/xml`, `html/template`, `net`, `net/http` and `net/url`. That one
+was real, and it is answered by rebuilding — not by merging.
+
+**Taken:**
+
+| upstream | change |
+|---|---|
+| `internal/dnsforward/msg.go` | `Server.reply` echoes the request's EDNS(0) state — DO bit and advertised UDP buffer — onto every response AGH generates itself (blocked, NXDOMAIN, REFUSED, SERVFAIL, NODATA, FORMERR), and adds no OPT at all when the request carried none. `NewMsgNOTIMPLEMENTED` keeps its constant 1452 and now sets EDNS(0) only if the request used it. AGH #8183. |
+| `internal/dnsforward/upstreams.go` | `newBootstrap` filters comment and empty lines, which `newPrivateConfig` already did here. No-op for this deployment's single `127.0.0.1:5353` bootstrap. |
+| `internal/filtering/rewrites.go` | A legacy rewrite answer that is neither an IP address nor a valid domain name is rejected by name instead of being stored as a CNAME target. |
+
+**Where the copy-paste would have hurt.** Upstream echoes `opt.UDPSize()` raw. This fork
+clamps: `maxAdvertisedUDPSize` in the dnsproxy fork (`proxy/dnscontext.go`) caps both the
+honoured buffer and the truncation point at **1232**, per DNS Flag Day 2020, because
+amplification floods advertise huge buffers deliberately — 10000 observed live (§7.18). The
+upstream line would have advertised a size this stack never honours, on exactly the
+responses that are cheapest for a reflector to trigger. `Server.reply` therefore echoes
+`min(opt.UDPSize(), maxAdvertisedUDPSize)`, with the constant mirrored in `msg.go` and
+pointed back at its source. Against upstream's unclamped version the fork's own test fails
+on the number itself:
+
+```
+--- FAIL: TestServer_reply_edns/oversized_buffer_clamped
+    expected: 0x4d0     (1232, honoured)
+    actual  : 0x2710    (10000, the client's raw ask)
+```
+
+**Two local patches had to be checked before taking it.** `setCookie`
+(`internal/dnscookie`) attaches the DNS Cookie to an existing OPT and only creates one when
+the response has none; `scrub` in the dnsproxy fork likewise only adds an OPT when the
+response has none. Both now find the OPT that `reply` created, so the response still carries
+exactly **one** OPT record. What changed is its content: the cookie path used to create the
+OPT itself, at `dns.MinMsgSize` with the DO bit dropped.
+
+Measured against the live resolver, same query before and after deployment:
+
+```
+# v0.107.78-edge — dig @127.0.0.1 +dnssec doubleclick.net A
+; EDNS: version: 0, flags:; udp: 512
+; COOKIE: 29295a0a91e11e80... (good)
+
+# v0.107.79-edge — same query
+; EDNS: version: 0, flags: do; udp: 1232
+; COOKIE: 4cd1e9685440e85c... (good)
+
+# v0.107.79-edge — dig +bufsize=10000  (clamp holds on the wire)
+; EDNS: version: 0, flags: do; udp: 1232
+
+# v0.107.79-edge — dig +noedns        (no OPT in the reply, as RFC 6891 requires)
+(no OPT PSEUDOSECTION)
+```
+
+**Deliberately skipped.** The **DDR / `TLSConfigProvider` refactor** moves `hasIPAddrs`
+behind an interface and reorders `makeDDRResponse` so DoT is appended before DoQ — but it
+also restores the three-way priority tie that §7.19 removed, so taking it would be a
+regression; it is behaviourally inert here in any case, since this host's certificate
+carries no IP addresses. The **DNS64 CNAME/DNAME chain fix** (dnsproxy #438) is unreachable:
+`use_dns64` is `false`. **dnsproxy v0.84.0/v0.84.1** is not taken as a dependency bump: its
+only functional content is that DNS64 fix, a `dnsproxytest` helper package, a Go bump, and
+`AGDNS-4357`, which **unexports every field of `proxy.Proxy`** — a breaking API change
+straight through the surface this fork patches (the pooled UDP write path, the QUIC server
+config, the RRL and cookie hooks) for no security benefit. The `strict_sni_check`
+deprecation is already `false` here. The rest — the `client_v2` dashboard and the `edge`
+channel's new versioning scheme, the DHCPv6/`dhcpsvc` database rework, the install API's
+`language` property, static-lease hostname removal, translations and blocked-services data —
+sits in code this fork strips or does not reach.
+
+**On the version string as a review marker.** §7.21 records that the version is a review
+marker, not an ancestry claim. This release exposed a hole in how that marker was read:
+`v0.107.78` existed in the build clone only because `git fetch upstream --tags` had pulled
+**upstream's** tag, and the tooling that reports "which release was reviewed" reads the
+newest local `v*.*.*` tag. Fetching upstream would therefore have declared v0.107.79
+reviewed before anyone read it. Fixed by tagging the fork's own commits: `v0.107.79` (and,
+retroactively, `v0.107.78`) are now annotated tags in `Ozy-666/AdGuardHome-Edge` on the
+reviewed commit, and upstream's tags are kept locally under `upstream-v*`.
+
+**Verified after deployment:** `v0.107.79-edge`, built with Go 1.26.6, `GOAMD64=v3`; the
+three EDNS behaviours above; plain DNS, DoH via nginx, DoT and DoQ all answering; DNSSEC
+still validating (`AD` on `cloudflare.com`, SERVFAIL on `dnssec-failed.org`); no errors in
+the journal. Go 1.26.7 (2026-08-19) exists and is stable but carries `net/http` bug fixes
+only — it is not a security release, and the move that mattered was 1.26.5 → 1.26.6.
+
+The same two test failures remain pre-existing and unrelated, re-confirmed against an
+untouched worktree of the pre-change commit: `internal/configmigrate` (`session_ttl: 720h`
+vs golibs' `30d`) and `internal/next/dnssvc` (one listen address vs one per core under
+SO_REUSEPORT sharding).
+
 ---
 
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
@@ -1982,6 +2083,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.79-edge` | 2026-08-21 | **security:** upstream v0.107.79 reviewed; the release's own security content needed nothing from its tree — GHSA-w6v6-f44j-3rj2 (DoQ unidirectional stream state exhaustion) is a `dnsproxy` advisory this fork answered on 2026-07-31 in `df16938`, and the other item is the Go toolchain, addressed by rebuilding on **Go 1.26.6** (security fixes to the `go` command, `crypto/tls`, `encoding/asn1`, `encoding/xml`, `html/template`, `net`, `net/http`, `net/url`; the deployed binary had been built with 1.26.5). **fix:** generated responses now echo the request's EDNS(0) DO bit and buffer size (AGH #8183) — adapted, not copied: the advertised size is clamped to `maxAdvertisedUDPSize` (1232), because upstream's raw echo would advertise a buffer this stack never honours on exactly the responses cheapest to reflect. Blocked answers previously carried the cookie path's OPT at 512 with DO dropped. Also taken: bootstrap comment filtering and CNAME rewrite-target validation. Skipped: the DDR/`TLSConfigProvider` refactor (restores the priority tie §7.19 removed), the DNS64 fix (`use_dns64: false`), and dnsproxy v0.84.x (`AGDNS-4357` unexports every `proxy.Proxy` field, no security content) (§7.22) |
 | `v0.107.78-edge` | 2026-07-31 | **security:** upstream v0.107.78 reviewed and three `dnsproxy` patches taken — AA bit cleared on relayed responses (AGH #7955), FORMERR instead of a silent drop for malformed UDP (GHSA-p5f5-3p5g-rfjw, the JIGGLE mitigation), and unidirectional QUIC streams refused on DoQ with DoH3 split into its own config (GHSA-qr92-rwvw-mhgh / GHSA-cccx-2r6r-m9r4, where this fork was already ahead at 64 vs upstream's `math.MaxUint16`). Nothing was needed in AdGuard Home itself; the DNSCrypt-upstream fixes and `max_http_size` were skipped as not applicable. The FORMERR reply was measured at **0.36×** the triggering packet, a deamplifier. Closes the "deferred by decision" dnsproxy v0.83.0 item below (§7.21) |
 | `v0.107.77-edge` | 2026-07-30 | **feat:** DDR designations now **ranked** `1` DoH (443, `h3,h2`) / `2` DoQ / `3` DoT instead of sharing priority 1 (upstream's own `TODO`). Equal priorities are a tie that RFC 9460 §2.4.1 has clients break at random, so a client supporting all three could land on the slowest transport on every discovery. Ranked by **reachability, not speed**: DoQ measures fastest but sits on port 853, which restrictive networks block, and a blocked port costs a timeout before fallback; 443 carries `h3`+`h2` in one designation so an HTTP/3 failure falls back to TCP without leaving the record (§7.19) |
 | `v0.107.77-edge` | 2026-07-30 | **fix:** DoT listeners now offer the RFC 7858 §6 `dot` ALPN (dnsproxy fork `14c4d5b`) — the DDR designation advertised `alpn="dot"` while the port-853 handshake negotiated no ALPN at all, because upstream passes the shared `TLSConfig` to `tls.NewListener` unchanged. ALPN stays optional per RFC 7858 §3.1 (a client sending none still connects, verified); the only behavior change is RFC 7301 conformance for a client offering no common token (§7.20) |
