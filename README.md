@@ -1642,7 +1642,7 @@ would send.
 | `google.com` | 1,131 | 1,131 | 17.3× | 1,103 / 1,103 / 1,103 |
 | `yahoo.com` | 824 | 824 | 12.9× | 796 / 796 / 796 |
 
-Fourteen of eighteen collapse from a packed datagram to a bare header. The residual
+Fifteen of eighteen collapse from a packed datagram to a bare header. The residual
 **1.4× against the majors' 1.0× is entirely the DNS Cookie** — verified directly rather
 than inferred:
 
@@ -1659,17 +1659,45 @@ return 796–1,228 B over UDP from Google, Cloudflare **and** Quad9 — because 
 answers fit under 1232 and are therefore never truncated by anyone. No resolver
 truncates what fits, and a full answer that fits in one datagram is not a defect. Any
 comparison table that reads "them 1.0×, us 17×" is comparing truncation-eligible names
-against names that were never eligible. Our rows for those three names are now the
-majors' rows plus the 28-byte cookie.
+against names that were never eligible. Our rows for those three names are the majors'
+rows plus the 28-byte cookie — `aol.com` 1,228 + 28 = 1,256, `yahoo.com` 796 + 28 = 824.
+
+*`google.com` is the exception, and it is not a size behaviour.* A re-run at 17:38 put our
+`google.com` row at 1,215 against the majors' 1,103 — **+112, not +28**. The cause is a
+record count, not a byte count: our chain returns **17** TXT records where all four
+`ns[1-4].google.com` return **16**. The extra one is
+`arcules-domain-verification=…`, which the authoritative servers no longer publish. It is
+not a long-lived stale entry in AGH — the RRset was 42 s old (TTL 258 of 300) when
+measured — and it is not AGH's cache at all: `dnscrypt-proxy` on `127.0.0.1:5053` serves
+all 17 including that record, while Quad9 behind it returns 16 without it. So the delta
+enters the chain at the DNSCrypt cache. Tracked separately; it has nothing to do with
+truncation, but anyone re-running this census on `google.com` will see the +112 and should
+not read it as a size defect.
 
 *Our responses can exceed the advertised 1232 clamp by the cookie length.* `aol.com`
 leaves at **1,256 B** where the clamp advertises 1232: the pre-cookie message is 1,228 B,
 fits, is not truncated — and the server cookie is appended afterwards, outside the
 budget `Truncate` accounted for. This is **pre-existing and independent of this change**
-(it needs an untruncated response, which this change never touches), and Google and
-Cloudflare do the same thing on `paypal.com` (1,237 B). Recorded here, not fixed:
-correcting it means accounting for the cookie before the clamp, which is a change to the
-cookie path, not the truncation path.
+(it needs an untruncated response, which this change never touches).
+
+Cloudflare does exactly the same thing, and this is checkable rather than inferred — a
+resolver states the buffer it honours in its own response OPT:
+
+```
+# TXT paypal.com, +dnssec +bufsize=4096 +ignore +notcp, from ad-astra 2026-09-01 17:35
+194.180.189.33   advertises udp: 1232   sent 67      (truncated: 1237 + 28 > 1232)
+1.1.1.1          advertises udp: 1232   sent 1237    <- same overshoot, same numbers
+8.8.8.8          advertises udp:  512   sent 1237
+9.9.9.9          advertises udp:  512   sent 39
+```
+
+Cloudflare advertises 1232 and sends 1237, which is our behaviour exactly. Google
+advertises 512 and sends 1237 — the same class of inconsistency, larger, though a flat
+512 advertisement is better read as a fixed value than as a clamp claim. Only Quad9 is
+self-consistent here. **The cookie cuts both ways:** because 1,237 + 28 = 1,265 exceeds
+our clamp, we *truncate* `paypal.com` to 67 B — a name Cloudflare and Google send whole.
+Recorded, not fixed: correcting it means accounting for the cookie before the clamp,
+which is a change to the cookie path, not the truncation path.
 
 **Verified after deployment:** `v0.107.79-edge` rebuilt against `dnsproxy` `94f9910`,
 `GOAMD64=v3`, installed 2026-09-01 17:16 Riga. Truncated answers empty on the wire from
@@ -2193,7 +2221,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
-| `v0.107.79-edge` | 2026-09-01 | **security:** truncated UDP responses are now **emptied, not filled** (dnsproxy fork `c9c8de7`). `(*dns.Msg).Truncate` packs the datagram with as many RRs as fit before setting `TC`; RFC 2181 §9 forbids a conforming client from using them, so they were reflectable bytes serving no client. `proxy.scrub` now drops `Answer`/`Ns` and reduces `Extra` to the OPT once `TC` is set on plain UDP — header + question + OPT, as Google/Cloudflare/Quad9 return. The OPT is kept for the DNS Cookie (return-routability on the TCP retry) and the RFC 6891 EDNS echo. Complements the 1232 clamp rather than replacing it: the clamp decides *when* `TC` is set, this decides *how much* is reflected once it is. Census from the ad-astra vantage: 14 of 18 TXT-amplification names collapse from 1,023–1,256 B to **63–71 B**; the residual 1.4× vs the majors' 1.0× is the 28-byte cookie, verified with `+nocookie`. TCP/DoT/DoQ/DoH structurally unaffected (`dnsSize` returns `MaxMsgSize`, so `TC` never sets) (§7.23) |
+| `v0.107.79-edge` | 2026-09-01 | **security:** truncated UDP responses are now **emptied, not filled** (dnsproxy fork `c9c8de7`). `(*dns.Msg).Truncate` packs the datagram with as many RRs as fit before setting `TC`; RFC 2181 §9 forbids a conforming client from using them, so they were reflectable bytes serving no client. `proxy.scrub` now drops `Answer`/`Ns` and reduces `Extra` to the OPT once `TC` is set on plain UDP — header + question + OPT, as Google/Cloudflare/Quad9 return. The OPT is kept for the DNS Cookie (return-routability on the TCP retry) and the RFC 6891 EDNS echo. Complements the 1232 clamp rather than replacing it: the clamp decides *when* `TC` is set, this decides *how much* is reflected once it is. Census from the ad-astra vantage: 15 of 18 TXT-amplification names collapse from 1,023–1,256 B to **63–71 B**; the residual 1.4× vs the majors' 1.0× is the 28-byte cookie, verified with `+nocookie`. TCP/DoT/DoQ/DoH structurally unaffected (`dnsSize` returns `MaxMsgSize`, so `TC` never sets) (§7.23) |
 | `v0.107.79-edge` | 2026-08-21 | **security:** upstream v0.107.79 reviewed; the release's own security content needed nothing from its tree — GHSA-w6v6-f44j-3rj2 (DoQ unidirectional stream state exhaustion) is a `dnsproxy` advisory this fork answered on 2026-07-31 in `df16938`, and the other item is the Go toolchain, addressed by rebuilding on **Go 1.26.6** (security fixes to the `go` command, `crypto/tls`, `encoding/asn1`, `encoding/xml`, `html/template`, `net`, `net/http`, `net/url`; the deployed binary had been built with 1.26.5). **fix:** generated responses now echo the request's EDNS(0) DO bit and buffer size (AGH #8183) — adapted, not copied: the advertised size is clamped to `maxAdvertisedUDPSize` (1232), because upstream's raw echo would advertise a buffer this stack never honours on exactly the responses cheapest to reflect. Blocked answers previously carried the cookie path's OPT at 512 with DO dropped. Also taken: bootstrap comment filtering and CNAME rewrite-target validation. Skipped: the DDR/`TLSConfigProvider` refactor (restores the priority tie §7.19 removed), the DNS64 fix (`use_dns64: false`), and dnsproxy v0.84.x (`AGDNS-4357` unexports every `proxy.Proxy` field, no security content) (§7.22) |
 | `v0.107.78-edge` | 2026-07-31 | **security:** upstream v0.107.78 reviewed and three `dnsproxy` patches taken — AA bit cleared on relayed responses (AGH #7955), FORMERR instead of a silent drop for malformed UDP (GHSA-p5f5-3p5g-rfjw, the JIGGLE mitigation), and unidirectional QUIC streams refused on DoQ with DoH3 split into its own config (GHSA-qr92-rwvw-mhgh / GHSA-cccx-2r6r-m9r4, where this fork was already ahead at 64 vs upstream's `math.MaxUint16`). Nothing was needed in AdGuard Home itself; the DNSCrypt-upstream fixes and `max_http_size` were skipped as not applicable. The FORMERR reply was measured at **0.36×** the triggering packet, a deamplifier. Closes the "deferred by decision" dnsproxy v0.83.0 item below (§7.21) |
 | `v0.107.77-edge` | 2026-07-30 | **feat:** DDR designations now **ranked** `1` DoH (443, `h3,h2`) / `2` DoQ / `3` DoT instead of sharing priority 1 (upstream's own `TODO`). Equal priorities are a tie that RFC 9460 §2.4.1 has clients break at random, so a client supporting all three could land on the slowest transport on every discovery. Ranked by **reachability, not speed**: DoQ measures fastest but sits on port 853, which restrictive networks block, and a blocked port costs a timeout before fallback; 443 carries `h3`+`h2` in one designation so an HTTP/3 failure falls back to TCP without leaving the record (§7.19) |
@@ -2279,8 +2307,9 @@ Three additional items were added from profiler-driven analysis post-audit.
 OPT after `Truncate` has accounted for the EDNS(0) buffer, so an untruncated response that
 fits at 1,228 B leaves at 1,256 B — 24 B above the clamp this stack advertises
 (`aol.com`/TXT, measured 2026-09-01, §7.23). It predates the §7.23 truncation change and is
-not reachable through it: the overshoot needs a response that was never truncated. Google
-and Cloudflare exhibit the same behaviour (`paypal.com`/TXT at 1,237 B). Fixing it means
+not reachable through it: the overshoot needs a response that was never truncated.
+Cloudflare advertises 1232 and sends 1,237 B on `paypal.com`/TXT — the same overshoot with
+the same numbers, read out of its own response OPT rather than assumed. Fixing it means
 charging the cookie against the budget in the cookie path, not the truncation path.
 
 All 23 audit items remain closed. The `urlfilter` `noIndex` regex-gate optimization (§7.7) was
