@@ -1668,11 +1668,35 @@ record count, not a byte count: our chain returns **17** TXT records where all f
 `ns[1-4].google.com` return **16**. The extra one is
 `arcules-domain-verification=…`, which the authoritative servers no longer publish. It is
 not a long-lived stale entry in AGH — the RRset was 42 s old (TTL 258 of 300) when
-measured — and it is not AGH's cache at all: `dnscrypt-proxy` on `127.0.0.1:5053` serves
-all 17 including that record, while Quad9 behind it returns 16 without it. So the delta
-enters the chain at the DNSCrypt cache. Tracked separately; it has nothing to do with
-truncation, but anyone re-running this census on `google.com` will see the +112 and should
-not read it as a size defect.
+measured.
+
+**It was transient, and it is already gone.** Two diagnoses were attempted while it was
+live and neither survived. *"It enters at the DNSCrypt cache"* (this section's first
+revision) rested on one comparison — `dnscrypt-proxy` on `127.0.0.1:5053` served all 17
+while plain `9.9.9.9` returned 16 — which does not establish a cache, since
+`dnscrypt-proxy` reaches Quad9 over a DNSCrypt stamp and not over plain UDP to that
+address. *"Something above `dnscrypt-proxy` re-supplies it on every refresh"* was better
+evidenced — the TTL was watched across zero at two layers, still returning 17 — but it
+described the supply as standing. It was not:
+
+```
+# sampled at dnscrypt-proxy 127.0.0.1:5053, 6 s apart
+17:47:46 ttl=220 count=16 arcules=0
+17:48:05 ttl=202 count=16 arcules=0
+# and across the whole chain at 17:48:21
+edge     count=16 arcules=0 ttl=300
+unbound  count=16 arcules=0 ttl=300
+dnscrypt count=16 arcules=0 ttl=185     <- live TTL, freshly refetched, record absent
+```
+
+The record stopped arriving with no intervention, roughly 25 minutes after it was first
+seen, while the authoritative set read 16 throughout. So this was a **propagation window
+in which our chain held a view the authoritative servers had already moved past** — a
+transient condition, not a standing defect and not a cache to go and fix. The lasting
+lesson is about method rather than about DNS: both diagnoses were confident readings of a
+target that was still moving, and the only reason either was caught is that the number was
+re-measured instead of being cited from the run that produced it. Anyone re-running this
+census on `google.com` may see +28, +112, or neither, depending on when.
 
 *Our responses can exceed the advertised 1232 clamp by the cookie length.* `aol.com`
 leaves at **1,256 B** where the clamp advertises 1232: the pre-cookie message is 1,228 B,
@@ -1680,24 +1704,37 @@ fits, is not truncated — and the server cookie is appended afterwards, outside
 budget `Truncate` accounted for. This is **pre-existing and independent of this change**
 (it needs an untruncated response, which this change never touches).
 
-Cloudflare does exactly the same thing, and this is checkable rather than inferred — a
-resolver states the buffer it honours in its own response OPT:
+**This is a claim about us and only us — an earlier revision of this section said
+Cloudflare "does exactly the same thing", and that was a misreading of the OPT.** The
+correction is recorded here rather than edited away, because the misreading is an easy
+one to repeat:
 
 ```
 # TXT paypal.com, +dnssec +bufsize=4096 +ignore +notcp, from ad-astra 2026-09-01 17:35
 194.180.189.33   advertises udp: 1232   sent 67      (truncated: 1237 + 28 > 1232)
-1.1.1.1          advertises udp: 1232   sent 1237    <- same overshoot, same numbers
-8.8.8.8          advertises udp:  512   sent 1237
+1.1.1.1          advertises udp: 1232   sent 1237
+8.8.8.8          advertises udp:  512   sent 1237    <- the row that settles it
 9.9.9.9          advertises udp:  512   sent 39
 ```
 
-Cloudflare advertises 1232 and sends 1237, which is our behaviour exactly. Google
-advertises 512 and sends 1237 — the same class of inconsistency, larger, though a flat
-512 advertisement is better read as a fixed value than as a clamp claim. Only Quad9 is
-self-consistent here. **The cookie cuts both ways:** because 1,237 + 28 = 1,265 exceeds
-our clamp, we *truncate* `paypal.com` to 67 B — a name Cloudflare and Google send whole.
-Recorded, not fixed: correcting it means accounting for the cookie before the clamp,
-which is a change to the cookie path, not the truncation path.
+The payload size in a **response** OPT is the responder's own maximum *receive* size, not
+a cap on what it will send. RFC 6891 §6.2.4 describes it as what a requestor probes with
+"an arbitrary QUERY used as a probe to discover a responder's maximum UDP payload size,
+followed immediately by an UPDATE that takes advantage of this size" — a buffer for
+traffic sent *to* the responder. What bounds the answer is §6.2.3, the **requestor's**
+size, and our probe advertised 4096. The `8.8.8.8` row proves it empirically: if the
+response OPT were a send limit, Google would be exceeding its own by 725 B on every large
+answer. Cloudflare advertising 1232 and sending 1,237 B is therefore not an overshoot at
+all — it is a receive buffer and a response size, two unrelated numbers.
+
+So the 1,256 B `aol.com` answer violates no RFC: the query advertised 4096. What it
+contradicts is **our own documented send behaviour** — §7.22 records 1232 as the size this
+stack honours on the wire, and the cookie puts us 24 B past it. That inconsistency is ours
+to own, and nothing comparable about Cloudflare is knowable from outside. **The cookie
+cuts both ways:** because 1,237 + 28 = 1,265 exceeds our clamp, we *truncate*
+`paypal.com` to 67 B — a name Cloudflare and Google send whole. Recorded, not fixed:
+correcting it means accounting for the cookie before the clamp, which is a change to the
+cookie path, not the truncation path.
 
 **Verified after deployment:** `v0.107.79-edge` rebuilt against `dnsproxy` `94f9910`,
 `GOAMD64=v3`, installed 2026-09-01 17:16 Riga. Truncated answers empty on the wire from
@@ -2307,10 +2344,11 @@ Three additional items were added from profiler-driven analysis post-audit.
 OPT after `Truncate` has accounted for the EDNS(0) buffer, so an untruncated response that
 fits at 1,228 B leaves at 1,256 B — 24 B above the clamp this stack advertises
 (`aol.com`/TXT, measured 2026-09-01, §7.23). It predates the §7.23 truncation change and is
-not reachable through it: the overshoot needs a response that was never truncated.
-Cloudflare advertises 1232 and sends 1,237 B on `paypal.com`/TXT — the same overshoot with
-the same numbers, read out of its own response OPT rather than assumed. Fixing it means
-charging the cookie against the budget in the cookie path, not the truncation path.
+not reachable through it: the overshoot needs a response that was never truncated. It
+violates no RFC — the probe advertised 4096, and a response OPT is a receive buffer, not a
+send cap (§6.2.4) — but it contradicts the 1232 send behaviour §7.22 documents for this
+stack. Fixing it means charging the cookie against the budget in the cookie path, not the
+truncation path.
 
 All 23 audit items remain closed. The `urlfilter` `noIndex` regex-gate optimization (§7.7) was
 measured against the real filter lists and shelved as unwarranted for the DNS
