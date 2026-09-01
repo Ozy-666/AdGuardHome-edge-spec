@@ -1670,33 +1670,58 @@ record count, not a byte count: our chain returns **17** TXT records where all f
 not a long-lived stale entry in AGH — the RRset was 42 s old (TTL 258 of 300) when
 measured.
 
-**It was transient, and it is already gone.** Two diagnoses were attempted while it was
-live and neither survived. *"It enters at the DNSCrypt cache"* (this section's first
-revision) rested on one comparison — `dnscrypt-proxy` on `127.0.0.1:5053` served all 17
-while plain `9.9.9.9` returned 16 — which does not establish a cache, since
-`dnscrypt-proxy` reaches Quad9 over a DNSCrypt stamp and not over plain UDP to that
-address. *"Something above `dnscrypt-proxy` re-supplies it on every refresh"* was better
-evidenced — the TTL was watched across zero at two layers, still returning 17 — but it
-described the supply as standing. It was not:
+**The mechanism: `google.com`'s own authoritative fleet does not agree with itself, and
+which half you reach depends on where you are standing.** Four diagnoses were proposed
+during the afternoon and evening. All four were wrong, and they are kept here because the
+sequence is more instructive than the answer:
+
+1. *"It enters at the DNSCrypt cache."* Rested on a single comparison — `dnscrypt-proxy`
+   served 17 while plain `9.9.9.9` served 16 — which never established a cache at all,
+   since `dnscrypt-proxy` reaches Quad9 over a DNSCrypt stamp, not over plain UDP to that
+   address.
+2. *"Something above `dnscrypt-proxy` re-supplies it on every refresh."* Better evidenced
+   (the TTL was watched across zero at two layers, still returning 17), but it never
+   identified what or why.
+3. *"A withdrawn record only we still serve."* False: the record is still published, by
+   half the fleet.
+4. *"A transient divergence that has converged."* False: it came back. The reading that
+   produced it — all four `ns[1-4].google.com` returning 16 — was taken **from ad-astra
+   only** and treated as the authoritative state rather than as one vantage's view of it.
+
+The actual state, 24 samples at 5 s intervals from this host, 2026-09-01 21:27–21:29:
 
 ```
-# sampled at dnscrypt-proxy 127.0.0.1:5053, 6 s apart
-17:47:46 ttl=220 count=16 arcules=0
-17:48:05 ttl=202 count=16 arcules=0
-# and across the whole chain at 17:48:21
-edge     count=16 arcules=0 ttl=300
-unbound  count=16 arcules=0 ttl=300
-dnscrypt count=16 arcules=0 ttl=185     <- live TTL, freshly refetched, record absent
+                    16-record view   17-record view
+ns1 216.239.32.10        24/24             —
+ns3 216.239.36.10          —             24/24     <- stable split, not a flap
+dnscrypt-proxy           19/24            5/24     <- lottery, per cache refill
+unbound                  24/24             —
+edge                     24/24             —
 ```
 
-The record stopped arriving with no intervention, roughly 25 minutes after it was first
-seen, while the authoritative set read 16 throughout. So this was a **propagation window
-in which our chain held a view the authoritative servers had already moved past** — a
-transient condition, not a standing defect and not a cache to go and fix. The lasting
-lesson is about method rather than about DNS: both diagnoses were confident readings of a
-target that was still moving, and the only reason either was caught is that the number was
-re-measured instead of being cited from the run that produced it. Anyone re-running this
-census on `google.com` may see +28, +112, or neither, depending on when.
+`ns1`/`ns2` serve 16 records; `ns3`/`ns4` serve 17, including
+`arcules-domain-verification=…`. Both readings are rock stable — 24 out of 24 each — so
+this is not a propagation flap on a moving zone. The same four addresses queried from
+ad-astra at the same moment return **16 from all four**. One anycast address, two
+versions of the RRset, decided by which instance the query lands on.
+
+So nothing in our chain was ever stale, and nothing was being withdrawn. Each cache layer
+holds whichever view it happened to fetch, which is why the layers disagree with each
+other and flip independently: at 21:26:10 the edge and unbound held 17 while
+`dnscrypt-proxy` already held 16; ninety seconds later all three read 16 while
+`dnscrypt-proxy` flipped back to 17 for five samples. A byte count for a name in this
+state measures which server the resolver asked, not how the resolver behaves — our census
+row read 1,215 on the 17-record view and 1,131 on the 16-record view, and 1,131 is
+Google's 1,103 plus our 28-byte cookie exactly.
+
+**The method lesson, which is the durable part.** Three confident mechanisms in one
+evening, each derived from a single vantage at a single moment, each overturned by the
+next sample. What finally cracked it was not better reasoning but a **second vantage**:
+the split is invisible from either host alone, because from either host alone the
+authoritative servers look self-consistent. Rule 4 applies to infrastructure state and not
+only to benchmarks — `n=1` from one place is an anecdote about that place. Anyone
+re-running this census on `google.com` may see +28 or +112 depending on which instance
+their resolver reached, and should not read either as our behaviour.
 
 *Our responses can exceed the advertised 1232 clamp by the cookie length.* `aol.com`
 leaves at **1,256 B** where the clamp advertises 1232: the pre-cookie message is 1,228 B,
