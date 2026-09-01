@@ -1714,14 +1714,25 @@ state measures which server the resolver asked, not how the resolver behaves —
 row read 1,215 on the 17-record view and 1,131 on the 16-record view, and 1,131 is
 Google's 1,103 plus our 28-byte cookie exactly.
 
-**The method lesson, which is the durable part.** Three confident mechanisms in one
-evening, each derived from a single vantage at a single moment, each overturned by the
-next sample. What finally cracked it was not better reasoning but a **second vantage**:
-the split is invisible from either host alone, because from either host alone the
-authoritative servers look self-consistent. Rule 4 applies to infrastructure state and not
-only to benchmarks — `n=1` from one place is an anecdote about that place. Anyone
-re-running this census on `google.com` may see +28 or +112 depending on which instance
-their resolver reached, and should not read either as our behaviour.
+**The method lesson, which is the durable part — and it is not rule 4.** The obvious
+reading is "small sample, take more". That reading is wrong, and the numbers say so: the
+final samplings were 24/24 from this host and 14/14 from the other, both perfectly stable,
+both entirely correct about their own vantage. Nobody was under-sampling. **The
+disagreement was between the vantages, not within either one**, and more samples from one
+place would never have found it — they would have hardened the wrong conclusion, because
+each vantage's view is stable, reproducible, and self-consistent. Stability was the trap,
+not the cure.
+
+That is a distinct failure from the usual `n=1` anecdote and deserves its own name.
+Rule 4 says a handful of runs is not a finding; this says **a thousand runs from one
+observation point is still one observation point**. Where a result depends on where you
+are standing — anycast, CDN edges, GeoDNS, per-instance caches, split-horizon zones —
+the axis to vary is *location*, and no amount of repetition along the other axis
+substitutes for it. Three sessions produced four mechanisms in one evening; what settled
+it was a second host, not more data and not better argument.
+
+Anyone re-running this census on `google.com` may see +28 or +112 depending on which
+instance their resolver reached, and should not read either as our behaviour.
 
 *Our responses can exceed the advertised 1232 clamp by the cookie length.* `aol.com`
 leaves at **1,256 B** where the clamp advertises 1232: the pre-cookie message is 1,228 B,
