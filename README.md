@@ -1796,9 +1796,10 @@ that had been open since `serverquic.go` was written.
 > described `9b6551d` as a Go *and* quic-go v0.59.0 → v0.60.0 bump, and presented the
 > quic-go half as a dependency move deliberately refused. There was no quic-go half. The
 > entire `go.mod` diff between `v0.84.1` and `v0.84.2` is the single `go` line; upstream has
-> pinned quic-go v0.60.0 since `v0.84.0`, so the v0.59.0 this fork carries is a standing
-> delta against upstream that predates this release and that taking v0.84.2 would not have
-> closed. The technical conclusion is unchanged — `ConnectionState().Used0RTT` is present in
+> pinned quic-go v0.60.0 since **`v0.82.0`** — this correction first said `v0.84.0`, which was
+> wrong in turn, and the tag walk settles it: `v0.81.1`…`v0.81.4` carry v0.59.0, every tag
+> from `v0.82.0` on carries v0.60.0. So the v0.59.0 this fork pins is a standing delta two
+> minor releases old, predating this release and untouched by taking v0.84.2. The technical conclusion is unchanged — `ConnectionState().Used0RTT` is present in
 > v0.59.0, so the port needed no bump — but "refused a bump" was a claim about something
 > upstream never offered here. Raised by the `/var/www` session while fact-checking the news
 > article against the release.
