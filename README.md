@@ -1787,10 +1787,21 @@ responses untouched) and pass either side by design.
 
 ### 7.24 DoQ 0-RTT Carries Only Replayable Opcodes (2026-09-04)
 
-Upstream `dnsproxy` v0.84.2 is two commits. One (`9b6551d`) is a Go 1.26.8 / quic-go
-v0.60.0 bump this fork does not need — builds run on Go 1.27.1, and the API the other
-commit uses is already present in the pinned quic-go v0.59.0. The other (`096ff91`,
-AGH-32) closes a check that had been open since `serverquic.go` was written.
+Upstream `dnsproxy` v0.84.2 is two commits. One (`9b6551d`) bumps the Go directive from
+1.26.6 to 1.26.8 — one line of `go.mod`, plus five CI and Docker strings — which this fork
+does not need, as builds run on Go 1.27.1. The other (`096ff91`, AGH-32) closes a check
+that had been open since `serverquic.go` was written.
+
+> **Correction (2026-09-04, same day).** This section and the release-history row first
+> described `9b6551d` as a Go *and* quic-go v0.59.0 → v0.60.0 bump, and presented the
+> quic-go half as a dependency move deliberately refused. There was no quic-go half. The
+> entire `go.mod` diff between `v0.84.1` and `v0.84.2` is the single `go` line; upstream has
+> pinned quic-go v0.60.0 since `v0.84.0`, so the v0.59.0 this fork carries is a standing
+> delta against upstream that predates this release and that taking v0.84.2 would not have
+> closed. The technical conclusion is unchanged — `ConnectionState().Used0RTT` is present in
+> v0.59.0, so the port needed no bump — but "refused a bump" was a claim about something
+> upstream never offered here. Raised by the `/var/www` session while fact-checking the news
+> article against the release.
 
 `validQUICMsg` walks the protocol-error list of
 [RFC 9250 §4.3.3](https://www.rfc-editor.org/rfc/rfc9250#section-4.3.3) and, until now,
@@ -2386,7 +2397,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
-| `v0.107.79-edge` | 2026-09-04 | **security:** DoQ 0-RTT early data now carries **only replayable opcodes** (dnsproxy fork `e66fa7f`, adapting upstream `096ff91`/AGH-32, the sole functional commit of v0.84.2). RFC 9250 §4.5 permits only QUERY and NOTIFY in 0-RTT; `validQUICMsg` had carried the other six protocol-error checks and a comment in place of the seventh ("not exposed by quic-go") since the file was written. A non-replayable opcode on a resumed connection, seen before `HandshakeComplete()`, now closes the connection with `DOQ_PROTOCOL_ERROR`. Reachable here — the listener uses `ListenEarly` with `Allow0RTT` and the proxy filtered no opcodes at all. quic-go was **not** bumped with upstream: `ConnectionState().Used0RTT` is already in the pinned v0.59.0, and v0.60.0 would move a dependency under exactly the code this fork patches. The gate's 0-RTT half is not empirically verified — no client here can drive it (§7.24, §12) |
+| `v0.107.79-edge` | 2026-09-04 | **security:** DoQ 0-RTT early data now carries **only replayable opcodes** (dnsproxy fork `e66fa7f`, adapting upstream `096ff91`/AGH-32, the sole functional commit of v0.84.2). RFC 9250 §4.5 permits only QUERY and NOTIFY in 0-RTT; `validQUICMsg` had carried the other six protocol-error checks and a comment in place of the seventh ("not exposed by quic-go") since the file was written. A non-replayable opcode on a resumed connection, seen before `HandshakeComplete()`, now closes the connection with `DOQ_PROTOCOL_ERROR`. Reachable here — the listener uses `ListenEarly` with `Allow0RTT` and the proxy filtered no opcodes at all. The release's other commit is a Go directive bump only (1.26.6 → 1.26.8); this fork builds on 1.27.1. No quic-go bump was needed or on offer — `ConnectionState().Used0RTT` is already in the pinned v0.59.0 (this row first said otherwise; see the correction in §7.24). The gate's 0-RTT half is not empirically verified — no client here can drive it (§7.24, §12) |
 | `v0.107.79-edge` | 2026-09-01 | **security:** truncated UDP responses are now **emptied, not filled** (dnsproxy fork `c9c8de7`). `(*dns.Msg).Truncate` packs the datagram with as many RRs as fit before setting `TC`; RFC 2181 §9 forbids a conforming client from using them, so they were reflectable bytes serving no client. `proxy.scrub` now drops `Answer`/`Ns` and reduces `Extra` to the OPT once `TC` is set on plain UDP — header + question + OPT, as Google/Cloudflare/Quad9 return. The OPT is kept for the DNS Cookie (return-routability on the TCP retry) and the RFC 6891 EDNS echo. Complements the 1232 clamp rather than replacing it: the clamp decides *when* `TC` is set, this decides *how much* is reflected once it is. Census from the ad-astra vantage: 15 of 18 TXT-amplification names collapse from 1,023–1,256 B to **63–71 B**; the residual 1.4× vs the majors' 1.0× is the 28-byte cookie, verified with `+nocookie`. TCP/DoT/DoQ/DoH structurally unaffected (`dnsSize` returns `MaxMsgSize`, so `TC` never sets) (§7.23) |
 | `v0.107.79-edge` | 2026-08-21 | **security:** upstream v0.107.79 reviewed; the release's own security content needed nothing from its tree — GHSA-w6v6-f44j-3rj2 (DoQ unidirectional stream state exhaustion) is a `dnsproxy` advisory this fork answered on 2026-07-31 in `df16938`, and the other item is the Go toolchain, addressed by rebuilding on **Go 1.26.6** (security fixes to the `go` command, `crypto/tls`, `encoding/asn1`, `encoding/xml`, `html/template`, `net`, `net/http`, `net/url`; the deployed binary had been built with 1.26.5). **fix:** generated responses now echo the request's EDNS(0) DO bit and buffer size (AGH #8183) — adapted, not copied: the advertised size is clamped to `maxAdvertisedUDPSize` (1232), because upstream's raw echo would advertise a buffer this stack never honours on exactly the responses cheapest to reflect. Blocked answers previously carried the cookie path's OPT at 512 with DO dropped. Also taken: bootstrap comment filtering and CNAME rewrite-target validation. Skipped: the DDR/`TLSConfigProvider` refactor (restores the priority tie §7.19 removed), the DNS64 fix (`use_dns64: false`), and dnsproxy v0.84.x (`AGDNS-4357` unexports every `proxy.Proxy` field, no security content) (§7.22) |
 | `v0.107.78-edge` | 2026-07-31 | **security:** upstream v0.107.78 reviewed and three `dnsproxy` patches taken — AA bit cleared on relayed responses (AGH #7955), FORMERR instead of a silent drop for malformed UDP (GHSA-p5f5-3p5g-rfjw, the JIGGLE mitigation), and unidirectional QUIC streams refused on DoQ with DoH3 split into its own config (GHSA-qr92-rwvw-mhgh / GHSA-cccx-2r6r-m9r4, where this fork was already ahead at 64 vs upstream's `math.MaxUint16`). Nothing was needed in AdGuard Home itself; the DNSCrypt-upstream fixes and `max_http_size` were skipped as not applicable. The FORMERR reply was measured at **0.36×** the triggering packet, a deamplifier. Closes the "deferred by decision" dnsproxy v0.83.0 item below (§7.21) |
