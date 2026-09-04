@@ -1785,6 +1785,97 @@ responses untouched) and pass either side by design.
 
 ---
 
+### 7.24 DoQ 0-RTT Carries Only Replayable Opcodes (2026-09-04)
+
+Upstream `dnsproxy` v0.84.2 is two commits. One (`9b6551d`) is a Go 1.26.8 / quic-go
+v0.60.0 bump this fork does not need — builds run on Go 1.27.1, and the API the other
+commit uses is already present in the pinned quic-go v0.59.0. The other (`096ff91`,
+AGH-32) closes a check that had been open since `serverquic.go` was written.
+
+`validQUICMsg` walks the protocol-error list of
+[RFC 9250 §4.3.3](https://www.rfc-editor.org/rfc/rfc9250#section-4.3.3) and, until now,
+stopped at the seventh entry with a comment where a check belongs:
+
+```go
+// 7. a server receives a "replayable" transaction in 0-RTT data
+//
+// The information necessary to validate this is not exposed by quic-go.
+```
+
+§4.5 is unambiguous about what that entry means — *"only transactions that have an OPCODE
+of QUERY or NOTIFY are considered replayable; therefore, other OPCODES MUST NOT be sent in
+0-RTT data"* — and a server supporting 0-RTT "MUST NOT immediately process non-replayable
+transactions received in 0-RTT data": it must queue them until the handshake completes,
+answer REFUSED with the EDE "Too Early", or close the connection with `DOQ_PROTOCOL_ERROR`.
+
+**Reachable here, not theoretical.** This fork's DoQ listener is created with
+`tr.ListenEarly` and `Allow0RTT: true`, AGH serves DoQ on 853 (`port_dns_over_quic: 853`),
+and no opcode filter existed anywhere in the proxy — `grep -n Opcode proxy/ upstream/` over
+non-test sources returned nothing before this change. A replayed 0-RTT `UPDATE` was handled
+like any other message.
+
+**The change** (`e66fa7f`, `Ozy-666/dnsproxy` `edge-udp-pool`). Upstream's implementation
+was taken verbatim — the 52-line region is byte-identical to `v0.84.2` — and adapted only
+at the seams, this fork's `serverquic.go` having diverged from upstream's by 60/61 lines.
+`validQUICMsg` gains `ctx` and the connection; the gate itself:
+
+```go
+func isNonReplayableEarlyData(conn *quic.Conn, req *dns.Msg) (ok bool) {
+	if isReplayableOpcode(req.Opcode) {
+		return false
+	}
+
+	if !conn.ConnectionState().Used0RTT {
+		return false
+	}
+
+	// The data is early data only if it arrived before the handshake completed
+	// on a resumed 0-RTT connection.
+	select {
+	case <-conn.HandshakeComplete():
+		return false
+	default:
+		return true
+	}
+}
+```
+
+The caller closes the connection with `DoQCodeProtocolError` — the third of the three
+behaviours §4.5 permits.
+
+**What it does not do.** The handshake state is read when the message is validated, not
+when it arrived, so early data whose handshake completes first is classified as 1-RTT and
+processed; conversely a genuine 1-RTT non-QUERY message that overtakes the
+handshake-complete signal aborts the connection. Both are properties of upstream's design,
+kept rather than improved on, and both are confined to opcodes this resolver has no
+legitimate use for either way. This is a conformance gate, not a guarantee.
+
+**Verified.** `go build ./...`, `go vet ./proxy/` and `gofmt -l` clean; `go test ./proxy/`
+green. `TestIsReplayableOpcode` — added here, upstream shipped no test — covers the half
+the RFC pins exactly, and was confirmed able to fail: a mutant returning
+`opcode != dns.OpcodeStatus` was caught on the `iquery` and `update` cases before the real
+implementation was accepted. The new debug string is present in the installed binary and
+absent from the pre-change backup (`AdGuardHome.bak.20260904-171836`), against a negative
+control that matches nothing. DoQ serves normally after the deploy:
+
+```
+$ kdig +quic +timeout=5 @127.0.0.1 example.com A
+;; QUIC session (QUICv1)-(TLS1.3)-(ECDHE-X25519)-(ECDSA-SECP256R1-SHA256)-(AES-128-GCM)
+;; ->>HEADER<<- opcode: QUERY; status: NOERROR; id: 0
+;; EDNS PSEUDOSECTION: UDP size: 1232 B
+example.com.        	287	IN	A	104.20.23.154
+;; From 127.0.0.1@853(QUIC) in 5.5 ms
+```
+
+**Not verified: the gate itself.** The above establishes that the code is in the running
+binary and that a normal QUERY over DoQ is unaffected — the regression risk. It does not
+establish that a non-QUERY transaction in early data is actually refused. `kdig` offers no
+control over 0-RTT or the opcode, so that path is reasoned from the source, not observed.
+Proving it needs a purpose-built quic-go client that resumes a session and writes an
+`UPDATE` as early data. Recorded as an open item in §12 rather than claimed.
+
+---
+
 ## 8. Performance Engineering — Transport Layer (dnsproxy)
 
 Summary of all transport-layer changes in the
@@ -2231,6 +2322,7 @@ all three Go forks. Rebuilt + redeployed; DNS/DoT verified live.
 | **h2c upgrade path removed** | Upstream AGDNS-4111/AGDNS-4038 backport: the plain-HTTP server (unix-socket DoH ingress + localhost UI) replaced the x/net h2c handler - whose HTTP/1.1→h2c upgrade path reads the request body without a bound - with stdlib `http.Protocols` (HTTP/1.1 + prior-knowledge unencrypted HTTP/2 only, RFC 9113). Unreachable from outside (fronting nginx clears the `Connection` header); defense-in-depth + removes the x/net h2c dependency from the server path | Low here — unbounded read on the upgrade path, admin/API surface is localhost-only |
 | **Rulelist download size cap** | Upstream AGDNS-4081 backport: filter-list updates stream through `ioutil.LimitReader` capped by new `filtering.max_http_size` (default 256 MB, upstream's raised `DefaultMaxRuleListSize`); download path split into `readFromHTTP`/`readFromFile`. Relevant here: 4 external blocklists auto-fetched on schedule; a misbehaving source can no longer stream an unbounded body through the parser | Low/Medium — disk/CPU exhaustion from a malicious or broken blocklist source |
 | **ECH base64 in DNS rewrites** | Upstream #8276 backport (1 line, `svcbmsg.go`): `ech=` values in SVCB/HTTPS rewrite rules are unpadded base64 but the parser required padding (`base64.StdEncoding` → `RawStdEncoding`), so valid `ech=` pairs were silently dropped from rewrite answers | Low — correctness of user-defined SVCB/HTTPS rewrites, not the server's own ECH |
+| **DoQ 0-RTT replay (dnsproxy)** | RFC 9250 §4.5 enforced at last (upstream `096ff91`/AGH-32 in v0.84.2, fork `e66fa7f`): a transaction whose opcode is neither QUERY nor NOTIFY, arriving as QUIC early data before the handshake completes, closes the connection with `DOQ_PROTOCOL_ERROR` instead of being processed. The listener runs with `Allow0RTT` and no opcode filter existed anywhere in the proxy, so replayed early data was previously handled like any other message. Best-effort by construction — the handshake state is read at validation time, not at arrival (§7.24) | Low — replay of a captured non-QUERY 0-RTT transaction; this deployment forwards to a local upstream that refuses such opcodes anyway |
 
 ---
 
@@ -2294,6 +2386,7 @@ top-level sections in `AdGuardHome.yaml`.
 
 | Version | Date | Summary |
 |---|---|---|
+| `v0.107.79-edge` | 2026-09-04 | **security:** DoQ 0-RTT early data now carries **only replayable opcodes** (dnsproxy fork `e66fa7f`, adapting upstream `096ff91`/AGH-32, the sole functional commit of v0.84.2). RFC 9250 §4.5 permits only QUERY and NOTIFY in 0-RTT; `validQUICMsg` had carried the other six protocol-error checks and a comment in place of the seventh ("not exposed by quic-go") since the file was written. A non-replayable opcode on a resumed connection, seen before `HandshakeComplete()`, now closes the connection with `DOQ_PROTOCOL_ERROR`. Reachable here — the listener uses `ListenEarly` with `Allow0RTT` and the proxy filtered no opcodes at all. quic-go was **not** bumped with upstream: `ConnectionState().Used0RTT` is already in the pinned v0.59.0, and v0.60.0 would move a dependency under exactly the code this fork patches. The gate's 0-RTT half is not empirically verified — no client here can drive it (§7.24, §12) |
 | `v0.107.79-edge` | 2026-09-01 | **security:** truncated UDP responses are now **emptied, not filled** (dnsproxy fork `c9c8de7`). `(*dns.Msg).Truncate` packs the datagram with as many RRs as fit before setting `TC`; RFC 2181 §9 forbids a conforming client from using them, so they were reflectable bytes serving no client. `proxy.scrub` now drops `Answer`/`Ns` and reduces `Extra` to the OPT once `TC` is set on plain UDP — header + question + OPT, as Google/Cloudflare/Quad9 return. The OPT is kept for the DNS Cookie (return-routability on the TCP retry) and the RFC 6891 EDNS echo. Complements the 1232 clamp rather than replacing it: the clamp decides *when* `TC` is set, this decides *how much* is reflected once it is. Census from the ad-astra vantage: 15 of 18 TXT-amplification names collapse from 1,023–1,256 B to **63–71 B**; the residual 1.4× vs the majors' 1.0× is the 28-byte cookie, verified with `+nocookie`. TCP/DoT/DoQ/DoH structurally unaffected (`dnsSize` returns `MaxMsgSize`, so `TC` never sets) (§7.23) |
 | `v0.107.79-edge` | 2026-08-21 | **security:** upstream v0.107.79 reviewed; the release's own security content needed nothing from its tree — GHSA-w6v6-f44j-3rj2 (DoQ unidirectional stream state exhaustion) is a `dnsproxy` advisory this fork answered on 2026-07-31 in `df16938`, and the other item is the Go toolchain, addressed by rebuilding on **Go 1.26.6** (security fixes to the `go` command, `crypto/tls`, `encoding/asn1`, `encoding/xml`, `html/template`, `net`, `net/http`, `net/url`; the deployed binary had been built with 1.26.5). **fix:** generated responses now echo the request's EDNS(0) DO bit and buffer size (AGH #8183) — adapted, not copied: the advertised size is clamped to `maxAdvertisedUDPSize` (1232), because upstream's raw echo would advertise a buffer this stack never honours on exactly the responses cheapest to reflect. Blocked answers previously carried the cookie path's OPT at 512 with DO dropped. Also taken: bootstrap comment filtering and CNAME rewrite-target validation. Skipped: the DDR/`TLSConfigProvider` refactor (restores the priority tie §7.19 removed), the DNS64 fix (`use_dns64: false`), and dnsproxy v0.84.x (`AGDNS-4357` unexports every `proxy.Proxy` field, no security content) (§7.22) |
 | `v0.107.78-edge` | 2026-07-31 | **security:** upstream v0.107.78 reviewed and three `dnsproxy` patches taken — AA bit cleared on relayed responses (AGH #7955), FORMERR instead of a silent drop for malformed UDP (GHSA-p5f5-3p5g-rfjw, the JIGGLE mitigation), and unidirectional QUIC streams refused on DoQ with DoH3 split into its own config (GHSA-qr92-rwvw-mhgh / GHSA-cccx-2r6r-m9r4, where this fork was already ahead at 64 vs upstream's `math.MaxUint16`). Nothing was needed in AdGuard Home itself; the DNSCrypt-upstream fixes and `max_http_size` were skipped as not applicable. The FORMERR reply was measured at **0.36×** the triggering packet, a deamplifier. Closes the "deferred by decision" dnsproxy v0.83.0 item below (§7.21) |
@@ -2375,8 +2468,9 @@ Three additional items were added from profiler-driven analysis post-audit.
 | Production profiling — per-query client-storage lock (§7.9) | 1 | ✅ Complete (2026-06-03; −79% of mutex delay) |
 | Co-design — real-time WAF query feed (§7.10) | 1 | ✅ Complete (2026-06-03) |
 | Server cookie appended outside the 1232 clamp budget (§7.23) | 1 | ⚠️ Open — recorded 2026-09-01, not fixed |
+| DoQ 0-RTT opcode gate not empirically verified (§7.24) | 1 | ⚠️ Open — verification gap, recorded 2026-09-04 |
 
-**One open item outside the original audit.** The DNS Cookie is appended to the response
+**Open items outside the original audit.** The DNS Cookie is appended to the response
 OPT after `Truncate` has accounted for the EDNS(0) buffer, so an untruncated response that
 fits at 1,228 B leaves at 1,256 B — 24 B above the clamp this stack advertises
 (`aol.com`/TXT, measured 2026-09-01, §7.23). It predates the §7.23 truncation change and is
@@ -2385,6 +2479,13 @@ violates no RFC — the probe advertised 4096, and a response OPT is a receive b
 send cap (§6.2.4) — but it contradicts the 1232 send behaviour §7.22 documents for this
 stack. Fixing it means charging the cookie against the budget in the cookie path, not the
 truncation path.
+
+**The second is a verification gap, not a defect.** The DoQ 0-RTT opcode gate (§7.24) is
+deployed and its opcode half is unit-tested, but no client available here can send a
+non-QUERY transaction as QUIC early data, so the branch that closes the connection has
+been reasoned from the source rather than observed on the wire. Closing it means writing a
+quic-go client that resumes a session and writes an `UPDATE` in 0-RTT. Until then the
+claim in §9 rests on code reading, and is marked as such.
 
 All 23 audit items remain closed. The `urlfilter` `noIndex` regex-gate optimization (§7.7) was
 measured against the real filter lists and shelved as unwarranted for the DNS
